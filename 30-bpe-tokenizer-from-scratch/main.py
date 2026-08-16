@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 BYTE_VOCAB_SIZE = 256
@@ -93,6 +93,60 @@ class BPETokenizer:
             ]
 
         return self
+
+    def _encode_pretoken(self, pretoken: str) -> tuple[int, ...]:
+        cached = self._encode_cache.get(pretoken)
+        if cached is not None:
+            return cached
+
+        ids = list(pretoken.encode("utf-8"))
+        while len(ids) >= 2:
+            pair: tuple[int, int] | None = None
+            best_rank = len(self.merges)
+            for index in range(len(ids) - 1):
+                candidate = (ids[index], ids[index + 1])
+                rank = self._merge_ranks.get(candidate)
+                if rank is not None and rank < best_rank:
+                    best_rank = rank
+                    pair = candidate
+            if pair is None:
+                break
+            ids = self._merge_symbols(ids, pair, self.merges[best_rank][2])
+
+        encoded = tuple(ids)
+        self._encode_cache[pretoken] = encoded
+        return encoded
+
+    def _encode_plain(self, text: str) -> list[int]:
+        ids: list[int] = []
+        for pretoken in self.pretokenize(text):
+            ids.extend(self._encode_pretoken(pretoken))
+        return ids
+
+    def encode(self, text: str, allow_special: bool = False) -> list[int]:
+        if not allow_special:
+            return self._encode_plain(text)
+
+        pattern = "(" + "|".join(re.escape(token) for token in self.specials) + ")"
+        ids: list[int] = []
+        for part in re.split(pattern, text):
+            if not part:
+                continue
+            special_id = self.specials.get(part)
+            if special_id is not None:
+                ids.append(special_id)
+            else:
+                ids.extend(self._encode_plain(part))
+        return ids
+
+    def decode(self, ids: Iterable[int]) -> str:
+        raw = bytearray()
+        for token_id in ids:
+            chunk = self.token_bytes.get(token_id)
+            if chunk is None:
+                raise ValueError(f"unknown token id: {token_id}")
+            raw.extend(chunk)
+        return raw.decode("utf-8")
 
     def _reset(self) -> None:
         self.merges = []
