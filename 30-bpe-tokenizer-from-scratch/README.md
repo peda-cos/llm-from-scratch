@@ -1,5 +1,7 @@
 # BPE Tokenizer From Scratch
 
+## Overview
+
 A byte-level Byte Pair Encoding tokenizer in pure Python. It trains a merge table from a raw text corpus, applies that table in learned rank order to fresh text, and decodes the resulting ids back to exactly the same UTF-8 string.
 
 The first 256 ids are the raw bytes, so every input string is representable before any merge happens. Two special ids sit immediately after the byte block, and the remaining vocabulary is learned merges. No runtime dependencies; the implementation is stdlib-only.
@@ -113,7 +115,7 @@ Everything in this module runs offline on CPU. Runtime is standard-library Pytho
 
 ## Measured results
 
-Measured on 2026-11-22 with Python 3.14.10 on Linux 7.3.4-1-cachyos x86_64. Command: `uv run python main.py demo --curve`. These are single-run local measurements, not benchmark claims.
+Measured locally with Python 3.14.10 on Linux 7.3.4-1-cachyos x86_64. Command: `uv run python main.py demo --curve`. These are single-run local measurements, not benchmark claims.
 
 Corpus: an excerpt from *Alice's Adventures in Wonderland* (Lewis Carroll, 1865), Project Gutenberg eBook #11. The Project Gutenberg header and footer were removed, then the first 24,000 characters were cut at a newline boundary: 23,945 characters, 4,559 whitespace-separated words, 10,348 pretokens, 1,092 unique pretokens. The text is public domain. It was retrieved through the [GITenberg mirror](https://github.com/GITenberg/Alice-s-Adventures-in-Wonderland_11) because `gutenberg.org` returned HTTP 503 from this environment.
 
@@ -126,7 +128,7 @@ Held-out sentence (78 characters, unseen during training):
 | 300 | 300 | 42 | 64 | 1.219 | 0.085 s |
 | 600 | 600 | 342 | 53 | 1.472 | 0.789 s |
 
-The 600-id tokenizer emits **53 ids instead of 64**, a 17.2% reduction on the same sentence. Both decodes reproduce the sentence exactly. The test suite collects 27 cases across 16 test functions.
+The 600-id tokenizer emits **53 ids instead of 64**, a 17.2% reduction on the same sentence. Both decodes reproduce the sentence exactly. The test suite collects 27 cases across 16 test functions. Token counts are deterministic for the committed corpus; wall-clock timings vary between runs.
 
 ## Design decisions
 
