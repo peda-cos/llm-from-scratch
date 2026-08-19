@@ -53,7 +53,7 @@ def _require_int(name: str, value: int, minimum: int) -> int:
     return value
 
 
-class SlidingWindowDataset(Dataset):
+class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
     """Map fixed-length windows of one id stream to next-token pairs.
 
     Every example is ``T + 1`` consecutive ids: the first ``T`` are the input
@@ -127,7 +127,7 @@ def make_dataloader(
     epoch_index: int = 0,
     shuffle: bool = True,
     drop_last: bool = False,
-) -> DataLoader:
+) -> DataLoader[tuple[Tensor, Tensor]]:
     """Build a single-epoch loader with a freshly seeded local generator.
 
     Rebuild the loader at the top of every epoch with the incremented
