@@ -107,3 +107,38 @@ class SlidingWindowDataset(Dataset):
         start = index * self.stride
         window = self.token_ids[start : start + self.context_length + 1]
         return window[:-1], window[1:]
+
+
+def epoch_seed(base_seed: int, epoch_index: int) -> int:
+    """The lesson's seed contract: ``base_seed + epoch_index``."""
+    base_seed = _require_int("base_seed", base_seed, 0)
+    epoch_index = _require_int("epoch_index", epoch_index, 0)
+    return base_seed + epoch_index
+
+
+def make_dataloader(
+    dataset: SlidingWindowDataset,
+    batch_size: int,
+    *,
+    base_seed: int,
+    epoch_index: int = 0,
+    shuffle: bool = True,
+    drop_last: bool = False,
+) -> DataLoader:
+    """Build a single-epoch loader with a freshly seeded local generator.
+
+    Rebuild the loader at the top of every epoch with the incremented
+    ``epoch_index``. Iterating one loader twice advances its generator and is
+    not the per-epoch contract.
+    """
+    batch_size = _require_int("batch_size", batch_size, 1)
+    generator = torch.Generator()
+    generator.manual_seed(epoch_seed(base_seed, epoch_index))
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        generator=generator if shuffle else None,
+        drop_last=drop_last,
+        num_workers=0,
+    )
