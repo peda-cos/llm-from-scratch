@@ -132,11 +132,14 @@ def make_dataloader(
 
     Rebuild the loader at the top of every epoch with the incremented
     ``epoch_index``. Iterating one loader twice advances its generator and is
-    not the per-epoch contract.
+    not the per-epoch contract. An empty dataset ignores ``shuffle`` because
+    PyTorch's RandomSampler rejects zero samples.
     """
     batch_size = _require_int("batch_size", batch_size, 1)
     generator = torch.Generator()
     generator.manual_seed(epoch_seed(base_seed, epoch_index))
+    # PyTorch's RandomSampler rejects a zero-length dataset; there is no order to shuffle.
+    shuffle = shuffle and len(dataset) > 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
