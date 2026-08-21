@@ -231,7 +231,9 @@ def _run_demo(args: argparse.Namespace) -> int:
         return 2
 
     tokenizer = ByteTokenizer()
+    encode_started = time.perf_counter()
     token_ids = _encode_corpus_to_ids(tokenizer, text)
+    encode_elapsed = time.perf_counter() - encode_started
     dataset = SlidingWindowDataset(token_ids, context_length, stride)
     examples = len(dataset)
     if examples == 0:
@@ -258,6 +260,7 @@ def _run_demo(args: argparse.Namespace) -> int:
     )
     print(f"examples_per_epoch={examples}")
     print(f"batches_per_epoch={examples // batch_size}")
+    print(f"encode_elapsed={encode_elapsed:.6f}s")
 
     non_overlap = SlidingWindowDataset.num_examples(
         token_ids.numel(), context_length, context_length
