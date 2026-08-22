@@ -112,6 +112,78 @@ class LearnedPositionalEmbedding(nn.Module):
         return self.embedding(positions).unsqueeze(0)
 
 
+def _build_sinusoidal_table(max_context_length: int, dim: int) -> Tensor:
+    """The fixed sin/cos table indexed by position and feature."""
+    positions = torch.arange(max_context_length, dtype=torch.float64)
+    pair_index = torch.arange((dim + 1) // 2, dtype=torch.float64)
+    angles = positions[:, None] / (10000.0 ** (2.0 * pair_index / dim))
+    table = torch.zeros((max_context_length, dim), dtype=torch.float64)
+    table[:, 0::2] = torch.sin(angles)
+    table[:, 1::2] = torch.cos(angles[:, : dim // 2])
+    return table.to(torch.float32)
+
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    """Fixed sinusoidal table with one D-vector per position in 0..L-1."""
+
+    max_context_length: int
+    dim: int
+    table: Tensor
+
+    def __init__(self, max_context_length: int, dim: int) -> None:
+        super().__init__()
+        self.max_context_length = _require_positive_int(
+            "max_context_length", max_context_length
+        )
+        self.dim = _require_positive_int("dim", dim)
+        self.register_buffer(
+            "table",
+            _build_sinusoidal_table(self.max_context_length, self.dim),
+            persistent=False,
+        )
+
+    def forward(self, seq_len: int) -> Tensor:
+        _check_seq_len(seq_len, self.max_context_length)
+        return self.table[:seq_len].unsqueeze(0)
+
+    def wavelengths(self) -> Tensor:
+        """Wavelength in positions for each sin/cos pair, shortest first."""
+        pair_count = (self.dim + 1) // 2
+        pair_index = torch.arange(
+            pair_count, dtype=self.table.dtype, device=self.table.device
+        )
+        return 2.0 * math.pi * torch.exp(
+            pair_index * (2.0 / self.dim) * math.log(10000.0)
+        )
+
+
+class EmbeddingComposer(nn.Module):
+    """Sum token and positional vectors into a (B, T, D) transformer input."""
+
+    token_embedding: TokenEmbedding
+    positional_embedding: LearnedPositionalEmbedding | SinusoidalPositionalEmbedding
+
+    def __init__(
+        self,
+        token_embedding: TokenEmbedding,
+        positional_embedding: LearnedPositionalEmbedding
+        | SinusoidalPositionalEmbedding,
+    ) -> None:
+        super().__init__()
+        if token_embedding.dim != positional_embedding.dim:
+            raise ValueError(
+                f"dim mismatch: token {token_embedding.dim}, "
+                f"positional {positional_embedding.dim}"
+            )
+        self.token_embedding = token_embedding
+        self.positional_embedding = positional_embedding
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        tokens = self.token_embedding(token_ids)
+        positions = self.positional_embedding(tokens.shape[1])
+        return tokens + positions
+
+
 def parameter_count(module: nn.Module) -> int:
     """Number of scalar parameters in the module tree."""
     return sum(parameter.numel() for parameter in module.parameters())
