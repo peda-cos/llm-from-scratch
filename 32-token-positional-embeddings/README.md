@@ -189,7 +189,7 @@ The `D=32` demo also reports the same learned-table bound at `T=16` and the same
 Verification, measured once after a warm environment:
 
 ```text
-27 passed in 0.88s
+28 passed in 0.95s
 Success: no issues found in 2 source files
 verify: ok
 ```
