@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import math
+import sys
+from collections.abc import Sequence
 
 import torch
 from torch import Tensor, nn
@@ -200,3 +203,153 @@ def neighbour_cosine(rows: Tensor, gap: int = 1) -> Tensor:
     if gap >= rows.shape[0]:
         raise ValueError(f"need more than {gap} rows, got {rows.shape[0]}")
     return F.cosine_similarity(rows[:-gap], rows[gap:], dim=-1)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Token and positional embedding demo for transformer inputs."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    demo = subparsers.add_parser(
+        "demo", help="print shapes, parameter counts, and similarity diagnostics"
+    )
+    demo.add_argument("--vocab-size", type=int, default=64, help="vocabulary size (V)")
+    demo.add_argument("--dim", type=int, default=64, help="model dimension (D)")
+    demo.add_argument(
+        "--context-length", type=int, default=16, help="tokens per sequence (T)"
+    )
+    demo.add_argument("--batch-size", type=int, default=4, help="batch size (B)")
+    demo.add_argument("--seed", type=int, default=1234, help="base seed")
+    return parser
+
+
+def _run_demo(args: argparse.Namespace) -> int:
+    try:
+        vocab_size = _require_positive_int("vocab_size", args.vocab_size)
+        dim = _require_positive_int("dim", args.dim)
+        context_length = _require_positive_int("context_length", args.context_length)
+        batch_size = _require_positive_int("batch_size", args.batch_size)
+        seed = args.seed
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("seed must be an int")
+    except (TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    token = TokenEmbedding(vocab_size, dim, seed=seed)
+    learned = LearnedPositionalEmbedding(context_length, dim, seed=seed + 1)
+    sinusoidal_context = max(4 * context_length, context_length + 1)
+    sinusoidal = SinusoidalPositionalEmbedding(sinusoidal_context, dim)
+    learned_composer = EmbeddingComposer(token, learned)
+    sinusoidal_composer = EmbeddingComposer(token, sinusoidal)
+
+    generator = torch.Generator().manual_seed(seed + 2)
+    token_ids = torch.randint(
+        0, vocab_size, (batch_size, context_length), generator=generator
+    )
+    tokens = token(token_ids)
+    learned_positions = learned(context_length)
+    sinusoidal_positions = sinusoidal(context_length)
+    learned_input = learned_composer(token_ids)
+    sinusoidal_input = sinusoidal_composer(token_ids)
+
+    print(f"token_ids: shape={tuple(token_ids.shape)} dtype={token_ids.dtype}")
+    print(f"token_embeddings: shape={tuple(tokens.shape)}")
+    print(f"learned_positions: shape={tuple(learned_positions.shape)}")
+    print(f"sinusoidal_positions: shape={tuple(sinusoidal_positions.shape)}")
+    print(
+        f"composed_inputs: learned={tuple(learned_input.shape)} "
+        f"sinusoidal={tuple(sinusoidal_input.shape)}"
+    )
+
+    token_params = parameter_count(token)
+    learned_position_params = parameter_count(learned)
+    sinusoidal_position_params = parameter_count(sinusoidal)
+    learned_total = parameter_count(learned_composer)
+    sinusoidal_total = parameter_count(sinusoidal_composer)
+    overhead = (learned_total - sinusoidal_total) / sinusoidal_total * 100.0
+    print("parameter_counts:")
+    print(f"  token={token_params}")
+    print(f"  learned_positional={learned_position_params}")
+    print(f"  sinusoidal_positional={sinusoidal_position_params}")
+    print(f"  learned_total={learned_total}")
+    print(f"  sinusoidal_total={sinusoidal_total}")
+    print(f"  overhead={overhead:.1f}%")
+
+    if not torch.allclose(learned_input, tokens + learned_positions):
+        raise AssertionError("learned composition is not token + positional")
+    if not torch.allclose(sinusoidal_input, tokens + sinusoidal_positions):
+        raise AssertionError("sinusoidal composition is not token + positional")
+    print("composition_sum=ok")
+
+    learned_delta = learned_input - tokens
+    sinusoidal_delta = sinusoidal_input - tokens
+    if not torch.allclose(learned_delta, learned_positions.expand_as(learned_delta)):
+        raise AssertionError("learned positions did not broadcast across the batch")
+    if not torch.allclose(sinusoidal_delta, sinusoidal_positions.expand_as(sinusoidal_delta)):
+        raise AssertionError("sinusoidal positions did not broadcast across the batch")
+    print("batch_broadcast=ok")
+
+    learned_rows = learned.embedding.weight.detach()
+    sinusoidal_rows = sinusoidal.table[:context_length]
+    print("neighbour_cosine:")
+    for gap in (1, 2, 4, 8):
+        if gap >= context_length:
+            continue
+        sinusoidal_cosine = neighbour_cosine(sinusoidal_rows, gap)
+        learned_cosine = neighbour_cosine(learned_rows, gap)
+        print(
+            f"  gap={gap} sinusoidal={float(sinusoidal_cosine.mean()):.4f} "
+            f"learned={float(learned_cosine.mean()):.4f}"
+        )
+    sinusoidal_gap1 = neighbour_cosine(sinusoidal_rows, 1)
+    learned_gap1 = neighbour_cosine(learned_rows, 1)
+    print(
+        f"  gap1_std: sinusoidal={float(sinusoidal_gap1.std()):.6f} "
+        f"learned={float(learned_gap1.std()):.6f}"
+    )
+
+    try:
+        learned(context_length + 1)
+    except ValueError as exc:
+        print(f"learned_positional: rejected at T+1 ({exc})")
+    else:
+        raise AssertionError("learned positional embedding accepted T+1")
+
+    accepted = sinusoidal(context_length + 1)
+    print(
+        "sinusoidal_positional: accepted at T+1 "
+        f"(shape={tuple(accepted.shape)})"
+    )
+    try:
+        sinusoidal(4 * context_length + 1)
+    except ValueError as exc:
+        print(f"sinusoidal_positional: rejected at max+1 ({exc})")
+    else:
+        raise AssertionError("sinusoidal positional embedding accepted max+1")
+    print(
+        "length_note: table-level bound only; downstream model length "
+        "generalization is not tested here"
+    )
+
+    wavelengths = sinusoidal.wavelengths()
+    pair_count = (dim + 1) // 2
+    bands = sorted({0, 1, 2, 4, 8, dim // 2 - 1})
+    print(f"wavelength_bands (dim={dim}):")
+    for band in bands:
+        if 0 <= band < pair_count:
+            print(f"  band={band} wavelength={float(wavelengths[band]):.6g}")
+
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command != "demo":
+        parser.error(f"unknown command: {args.command}")
+    return _run_demo(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
