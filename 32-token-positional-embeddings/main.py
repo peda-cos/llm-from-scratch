@@ -80,7 +80,8 @@ class TokenEmbedding(nn.Module):
             )
         if token_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("token_ids must be an int32 or int64 tensor")
-        return self.embedding(token_ids)
+        embedded: Tensor = self.embedding(token_ids)
+        return embedded
 
 
 class LearnedPositionalEmbedding(nn.Module):
@@ -112,7 +113,8 @@ class LearnedPositionalEmbedding(nn.Module):
         positions = torch.arange(
             seq_len, dtype=torch.long, device=self.embedding.weight.device
         )
-        return self.embedding(positions).unsqueeze(0)
+        embedded: Tensor = self.embedding(positions)
+        return embedded.unsqueeze(0)
 
 
 def _build_sinusoidal_table(max_context_length: int, dim: int) -> Tensor:
@@ -182,8 +184,8 @@ class EmbeddingComposer(nn.Module):
         self.positional_embedding = positional_embedding
 
     def forward(self, token_ids: Tensor) -> Tensor:
-        tokens = self.token_embedding(token_ids)
-        positions = self.positional_embedding(tokens.shape[1])
+        tokens: Tensor = self.token_embedding(token_ids)
+        positions: Tensor = self.positional_embedding(tokens.shape[1])
         return tokens + positions
 
 
