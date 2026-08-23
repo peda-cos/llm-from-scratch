@@ -288,28 +288,31 @@ def _run_demo(args: argparse.Namespace) -> int:
     sinusoidal_delta = sinusoidal_input - tokens
     if not torch.allclose(learned_delta, learned_positions.expand_as(learned_delta)):
         raise AssertionError("learned positions did not broadcast across the batch")
-    if not torch.allclose(sinusoidal_delta, sinusoidal_positions.expand_as(sinusoidal_delta)):
+    if not torch.allclose(
+        sinusoidal_delta, sinusoidal_positions.expand_as(sinusoidal_delta)
+    ):
         raise AssertionError("sinusoidal positions did not broadcast across the batch")
     print("batch_broadcast=ok")
 
     learned_rows = learned.embedding.weight.detach()
     sinusoidal_rows = sinusoidal.table[:context_length]
-    print("neighbour_cosine:")
-    for gap in (1, 2, 4, 8):
-        if gap >= context_length:
-            continue
-        sinusoidal_cosine = neighbour_cosine(sinusoidal_rows, gap)
-        learned_cosine = neighbour_cosine(learned_rows, gap)
+    if context_length > 1:
+        print("neighbour_cosine:")
+        for gap in (1, 2, 4, 8):
+            if gap >= context_length:
+                continue
+            sinusoidal_cosine = neighbour_cosine(sinusoidal_rows, gap)
+            learned_cosine = neighbour_cosine(learned_rows, gap)
+            print(
+                f"  gap={gap} sinusoidal={float(sinusoidal_cosine.mean()):.4f} "
+                f"learned={float(learned_cosine.mean()):.4f}"
+            )
+        sinusoidal_gap1 = neighbour_cosine(sinusoidal_rows, 1)
+        learned_gap1 = neighbour_cosine(learned_rows, 1)
         print(
-            f"  gap={gap} sinusoidal={float(sinusoidal_cosine.mean()):.4f} "
-            f"learned={float(learned_cosine.mean()):.4f}"
+            f"  gap1_std: sinusoidal={float(sinusoidal_gap1.std()):.6f} "
+            f"learned={float(learned_gap1.std()):.6f}"
         )
-    sinusoidal_gap1 = neighbour_cosine(sinusoidal_rows, 1)
-    learned_gap1 = neighbour_cosine(learned_rows, 1)
-    print(
-        f"  gap1_std: sinusoidal={float(sinusoidal_gap1.std()):.6f} "
-        f"learned={float(learned_gap1.std()):.6f}"
-    )
 
     try:
         learned(context_length + 1)

@@ -291,3 +291,25 @@ def test_demo_rejects_invalid_config(capsys: pytest.CaptureFixture[str]) -> None
     assert main(["demo", "--vocab-size", "0"]) == 2
     error = capsys.readouterr().err
     assert error.startswith("error:")
+
+
+def test_demo_accepts_single_token_context(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(
+        [
+            "demo",
+            "--vocab-size",
+            "4",
+            "--dim",
+            "4",
+            "--context-length",
+            "1",
+            "--batch-size",
+            "1",
+            "--seed",
+            "5",
+        ]
+    )
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "composition_sum=ok" in output
+    assert "neighbour_cosine:" not in output
