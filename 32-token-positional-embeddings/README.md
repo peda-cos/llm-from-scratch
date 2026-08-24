@@ -32,7 +32,7 @@ Every batch element has the same context length `T`; the positional tensor is `(
 
 `TokenEmbedding` wraps `nn.Embedding(V, D)`. Forward is one indexing operation from `(B, T)` int64 (or int32) ids to `(B, T, D)` float32. Backprop touches only rows used in the forward pass; unused rows receive zero gradient on that step. `nn.Embedding` initializes with `N(0, 1)`, so the module explicitly overwrites the weight with `N(0, 0.02)`. A local `torch.Generator` makes `seed=` reproducible without changing the global RNG.
 
-The token embedding and a future output projection are often tied in production models; this lesson exposes only the input side and does not build an LM head.
+The token embedding and a future output projection are often tied in production models; this lesson exposes only the input side and does not build an LM head. If the same matrix were reused as the output projection, the output side would touch every row during backward, unlike the input-only gradient mask tested here.
 
 ### Learned positional table
 
@@ -50,7 +50,7 @@ table[p, 2k + 1] = cos(angle(p, k))
 
 `SinusoidalPositionalEmbedding` builds the full `(max_context_length, D)` table once in float64, casts it to float32, and registers it as a non-persistent buffer. It has zero parameters. For odd `D`, the last even feature has no cosine partner; the implementation slices the angle matrix accordingly.
 
-Wavelengths are `2π * 10000 ** (2k/D)`, a geometric progression from `2π` upward. Lower feature pairs oscillate fastest (fine position); higher pairs oscillate slowest (coarse position). Because each sin/cos pair has norm 1, every row has norm `sqrt(D/2)`, and the cosine similarity for a fixed position offset is the same at every position.
+Wavelengths are `2π * 10000 ** (2k/D)`, a geometric progression from `2π` upward. Lower feature pairs oscillate fastest (fine position); higher pairs oscillate slowest (coarse position). Because each sin/cos pair has norm 1, every row has norm `sqrt(D/2)`, and the cosine similarity for a fixed position offset is the same at every position. Each pair is also a rotation, so for a fixed offset `k` the vector at position `p + k` is a linear function of the vector at `p`; attention can learn relative offsets without a separate parameter.
 
 The formula is defined for any position, but this lesson's module precomputes a fixed table and `forward` raises beyond `max_context_length`, exactly like the learned table. The formula's parameter-free extension is not a claim that a trained model generalizes to longer inputs.
 
