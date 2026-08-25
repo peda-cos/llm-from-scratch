@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, cast
 
 import pytest
@@ -11,6 +12,7 @@ from torch.nn import functional as F
 from main import (
     MultiHeadSelfAttention,
     attention_entropy,
+    main,
     parameter_count,
 )
 
@@ -292,3 +294,130 @@ def test_attention_entropy_matches_uniform_reference() -> None:
     assert bool((entropy <= math.log(4) + 1e-6).all())
     with pytest.raises(ValueError, match="shape"):
         attention_entropy(torch.ones((2, 3, 4)))
+
+
+def test_demo_smoke(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(
+        [
+            "demo",
+            "--dim",
+            "8",
+            "--heads",
+            "2",
+            "--context-length",
+            "4",
+            "--vocab-size",
+            "16",
+            "--epochs",
+            "1",
+            "--batch-size",
+            "8",
+            "--train-size",
+            "32",
+            "--learning-rate",
+            "0.02",
+            "--seed",
+            "3",
+        ]
+    )
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    for expected in (
+        "attention_weights: shape=(1, 2, 4, 4)",
+        "causal_violation_max=0.0",
+        "grad_flow=ok",
+        "final_val_loss=",
+        "heatmap_head=0",
+        "head_stats (queries 1..T-1):",
+        "epoch=1 train_loss=",
+    ):
+        assert expected in output
+
+
+def test_demo_heads_eight(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(
+        [
+            "demo",
+            "--heads",
+            "8",
+            "--train-size",
+            "64",
+            "--batch-size",
+            "32",
+            "--epochs",
+            "1",
+            "--seed",
+            "5",
+        ]
+    )
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "d_head=4" in output
+    assert "attention_weights: shape=(1, 8, 12, 12)" in output
+    assert "heatmap_head=0" in output
+
+
+def test_demo_is_deterministic(capsys: pytest.CaptureFixture[str]) -> None:
+    args = [
+        "demo",
+        "--dim",
+        "8",
+        "--heads",
+        "2",
+        "--context-length",
+        "4",
+        "--vocab-size",
+        "16",
+        "--epochs",
+        "1",
+        "--batch-size",
+        "8",
+        "--train-size",
+        "32",
+        "--learning-rate",
+        "0.02",
+        "--seed",
+        "3",
+    ]
+    assert main(args) == 0
+    first = capsys.readouterr().out
+    assert main(args) == 0
+    second = capsys.readouterr().out
+    assert first == second
+
+
+def test_demo_training_reduces_loss(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["demo"]) == 0
+    output = capsys.readouterr().out
+    initial_match = re.search(r"initial_val_loss=([0-9.]+)", output)
+    final_match = re.search(r"final_val_loss=([0-9.]+)", output)
+    assert initial_match is not None
+    assert final_match is not None
+    initial = float(initial_match.group(1))
+    final = float(final_match.group(1))
+    assert math.isfinite(initial)
+    assert math.isfinite(final)
+    assert final < initial
+    assert final < 1.0
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--dim", "30", "--heads", "4"], "divisible"),
+        (["--context-length", "1"], "context_length must be >= 2"),
+        (["--epochs", "0"], "epochs"),
+        (["--heatmap-head", "4"], "heatmap_head"),
+    ],
+)
+def test_demo_rejects_invalid_configuration(
+    args: list[str],
+    message: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["demo", *args]) == 2
+    error = capsys.readouterr().err
+    assert error.startswith("error:")
+    assert message in error
