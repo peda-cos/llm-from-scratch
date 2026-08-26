@@ -10,6 +10,7 @@ normalization-placement difference measurable without a training run.
 from __future__ import annotations
 
 import math
+from typing import Literal, overload
 
 import torch
 from torch import Tensor, nn
@@ -160,3 +161,114 @@ class FeedForward(nn.Module):
         _validate_sequence_input(x, self.d_model)
         output: Tensor = self.linear2(self.dropout(F.gelu(self.linear1(x))))
         return output
+
+
+class MultiHeadAttention(nn.Module):
+    """Causal multi-head self-attention with one fused QKV projection."""
+
+    d_model: int
+    num_heads: int
+    head_dim: int
+    max_context_length: int
+    qkv_projection: nn.Linear
+    output_projection: nn.Linear
+    attention_dropout: nn.Dropout
+    causal_mask: Tensor
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_context_length: int,
+        *,
+        dropout: float = 0.0,
+        init_std: float = 0.02,
+        seed: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = _require_positive_int("d_model", d_model)
+        self.num_heads = _require_positive_int("num_heads", num_heads)
+        self.max_context_length = _require_positive_int(
+            "max_context_length", max_context_length
+        )
+        dropout_probability = _require_probability("dropout", dropout)
+        init_std = _require_positive_float("init_std", init_std)
+        seed_value = _require_seed(seed)
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by num_heads: "
+                f"{self.d_model} % {self.num_heads} != 0"
+            )
+        self.head_dim = self.d_model // self.num_heads
+
+        self.qkv_projection = nn.Linear(self.d_model, 3 * self.d_model)
+        self.output_projection = nn.Linear(self.d_model, self.d_model)
+        self.attention_dropout = nn.Dropout(dropout_probability)
+
+        generator: torch.Generator | None = None
+        if seed_value is not None:
+            generator = torch.Generator(
+                device=self.qkv_projection.weight.device
+            ).manual_seed(seed_value)
+        _init_linear(self.qkv_projection, init_std, generator)
+        _init_linear(self.output_projection, init_std, generator)
+
+        # True means "blocked"; the table is derived state, not checkpoint state.
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(
+                torch.ones(
+                    self.max_context_length,
+                    self.max_context_length,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            ),
+            persistent=False,
+        )
+
+    def _split_heads(self, projected: Tensor) -> Tensor:
+        batch = projected.shape[0]
+        length = projected.shape[1]
+        return projected.reshape(
+            batch, length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+    @overload
+    def forward(
+        self, x: Tensor, return_weights: Literal[False] = False
+    ) -> Tensor: ...
+
+    @overload
+    def forward(
+        self, x: Tensor, return_weights: Literal[True]
+    ) -> tuple[Tensor, Tensor]: ...
+
+    def forward(
+        self, x: Tensor, return_weights: bool = False
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        batch, length, _ = _validate_sequence_input(
+            x, self.d_model, self.max_context_length
+        )
+
+        qkv = self.qkv_projection(x)
+        q, k, v = qkv.split(self.d_model, dim=-1)
+        queries = self._split_heads(q)
+        keys = self._split_heads(k)
+        values = self._split_heads(v)
+
+        scores = (queries @ keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = scores.masked_fill(
+            self.causal_mask[:length, :length], float("-inf")
+        )
+        weights = self.attention_dropout(torch.softmax(scores, dim=-1))
+        context = weights @ values
+        context = context.transpose(1, 2).reshape(
+            batch, length, self.d_model
+        )
+        output: Tensor = self.output_projection(context)
+
+        if return_weights:
+            return output, weights
+        return output
+
