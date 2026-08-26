@@ -272,3 +272,151 @@ class MultiHeadAttention(nn.Module):
             return output, weights
         return output
 
+
+def _seed_offset(seed: int | None, offset: int) -> int | None:
+    if seed is None:
+        return None
+    return seed + offset
+
+
+class TransformerBlock(nn.Module):
+    """One decoder block with the LayerNorms placed pre- or post-residual."""
+
+    d_model: int
+    max_context_length: int
+    pre_ln: bool
+    norm1: LayerNorm
+    attention: MultiHeadAttention
+    norm2: LayerNorm
+    feed_forward: FeedForward
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_context_length: int,
+        *,
+        pre_ln: bool = True,
+        dropout: float = 0.0,
+        init_std: float = 0.02,
+        seed: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = _require_positive_int("d_model", d_model)
+        self.max_context_length = _require_positive_int(
+            "max_context_length", max_context_length
+        )
+        if not isinstance(pre_ln, bool):
+            raise TypeError("pre_ln must be a bool")
+        dropout_probability = _require_probability("dropout", dropout)
+        init_std = _require_positive_float("init_std", init_std)
+        seed_value = _require_seed(seed)
+        self.pre_ln = pre_ln
+
+        self.norm1 = LayerNorm(self.d_model)
+        self.attention = MultiHeadAttention(
+            self.d_model,
+            num_heads,
+            self.max_context_length,
+            dropout=dropout_probability,
+            init_std=init_std,
+            seed=seed_value,
+        )
+        self.norm2 = LayerNorm(self.d_model)
+        self.feed_forward = FeedForward(
+            self.d_model,
+            dropout=dropout_probability,
+            init_std=init_std,
+            seed=_seed_offset(seed_value, 1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        _validate_sequence_input(x, self.d_model, self.max_context_length)
+        if self.pre_ln:
+            x = x + self.attention(self.norm1(x))
+            x = x + self.feed_forward(self.norm2(x))
+        else:
+            x = self.norm1(x + self.attention(x))
+            x = self.norm2(x + self.feed_forward(x))
+        return x
+
+
+class _DiagnosticStack(nn.Module):
+    """Embedding plus blocks, with no terminal norm, used by the gradient probe."""
+
+    d_model: int
+    max_context_length: int
+    vocabulary_size: int
+    pre_ln: bool
+    embedding: nn.Embedding
+    blocks: nn.ModuleList
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        max_context_length: int,
+        vocabulary_size: int,
+        *,
+        pre_ln: bool,
+        seed: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = _require_positive_int("d_model", d_model)
+        num_layers = _require_positive_int("num_layers", num_layers)
+        self.max_context_length = _require_positive_int(
+            "max_context_length", max_context_length
+        )
+        self.vocabulary_size = _require_positive_int(
+            "vocabulary_size", vocabulary_size
+        )
+        if not isinstance(pre_ln, bool):
+            raise TypeError("pre_ln must be a bool")
+        seed_value = _require_seed(seed)
+        self.pre_ln = pre_ln
+
+        self.embedding = nn.Embedding(self.vocabulary_size, self.d_model)
+        generator: torch.Generator | None = None
+        if seed_value is not None:
+            generator = torch.Generator().manual_seed(seed_value)
+        nn.init.normal_(
+            self.embedding.weight,
+            mean=0.0,
+            std=0.02,
+            generator=generator,
+        )
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    self.d_model,
+                    num_heads,
+                    self.max_context_length,
+                    pre_ln=pre_ln,
+                    dropout=0.0,
+                    seed=_seed_offset(seed_value, 1 + layer_index),
+                )
+                for layer_index in range(num_layers)
+            ]
+        )
+
+    def forward(self, ids: Tensor) -> Tensor:
+        if ids.ndim != 2:
+            raise ValueError(f"ids must have shape (B, T), got {tuple(ids.shape)}")
+        if ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("ids must be an int32 or int64 tensor")
+        length = ids.shape[1]
+        if length < 1:
+            raise ValueError("sequence length must be >= 1")
+        if length > self.max_context_length:
+            raise ValueError(
+                f"sequence length {length} exceeds "
+                f"max_context_length {self.max_context_length}"
+            )
+        hidden: Tensor = self.embedding(ids)
+        for block in self.blocks:
+            hidden = block(hidden)
+        return hidden
+
+
