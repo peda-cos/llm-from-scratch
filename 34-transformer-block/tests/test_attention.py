@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+from typing import Any, cast
 
+import pytest
 import torch
 from torch import Tensor, nn
 
@@ -131,3 +133,24 @@ def test_causal_mask_is_nonpersistent_and_blocks_future() -> None:
     row_error = float((weights.sum(dim=-1) - 1.0).abs().max())
     assert row_error <= 1e-5
     assert block.to(torch.float64).causal_mask.dtype == torch.bool
+
+
+def test_attention_rejects_invalid_inputs() -> None:
+    with pytest.raises(ValueError, match="divisible"):
+        MultiHeadAttention(10, 4, 4)
+    with pytest.raises(ValueError, match="num_heads"):
+        MultiHeadAttention(8, 0, 4)
+    with pytest.raises(TypeError, match="d_model"):
+        MultiHeadAttention(cast(Any, 3.0), 1, 4)
+
+    block = MultiHeadAttention(8, 2, 4, seed=0)
+    with pytest.raises(ValueError, match="shape"):
+        block(_randn((2, 8), seed=2))
+    with pytest.raises(ValueError, match="d_model"):
+        block(_randn((1, 3, 7), seed=3))
+    with pytest.raises(ValueError, match="sequence length"):
+        block(torch.empty((1, 0, 8)))
+    with pytest.raises(ValueError, match="max_context_length"):
+        block(_randn((1, 5, 8), seed=4))
+    with pytest.raises(TypeError, match="floating-point"):
+        block(torch.ones((1, 2, 8), dtype=torch.int64))
