@@ -174,7 +174,7 @@ causal_check: future_weight_max=0.0 row_sum_max_error=2.38e-07
 parameter_counts: pre_ln=1222400 post_ln=1222400
 ```
 
-The pre-LN embedding gradient is `7.73e-02`; the post-LN embedding gradient is `9.00e-07`. The ratio is about `8.59e4`. The per-block norms explain the difference: pre-LN block gradients fall gently from `1.64e-01` to `6.12e-02`, while post-LN blocks before the last one are around `1e-7` and the last block is `1.82e-01`. Post-LN's gradient is concentrated near the output, exactly where a large learning-rate update is most destabilizing; the embedding path receives almost no signal. This is the initialization-time pattern that motivates warmup for post-LN and its removal for pre-LN.
+The pre-LN embedding gradient is `7.73e-02`; the post-LN embedding gradient is `9.00e-07`. The ratio is about `8.59e4`. The per-block norms explain the difference: pre-LN block gradients fall gently from `1.64e-01` to `6.12e-02`, while post-LN blocks before the last one sit between `1.0e-7` and `1.2e-6` and the last block is `1.82e-01`. Post-LN's gradient is concentrated near the output, exactly where a large learning-rate update is most destabilizing; the embedding path receives almost no signal. This is the initialization-time pattern that motivates warmup for post-LN and its removal for pre-LN.
 
 The `probe_loss` values are not directly comparable as model quality: post-LN's last block normalizes its output, so the output-energy loss is about 1, while the pre-LN residual stream is unnormalized at the top and its loss is about 0.027. The per-block gradient profile shows the ordering is not a loss-scale artifact.
 
@@ -193,7 +193,7 @@ causal_check: future_weight_max=0.0 row_sum_max_error=2.38e-07
 parameter_counts: pre_ln=2412032 post_ln=2412032
 ```
 
-At twelve layers the gap grows to about `2.06e5`. Pre-LN's gradient remains distributed across all twelve blocks. Post-LN's first eleven blocks sit near `1e-7` while the last block stays near `1.8e-01`.
+At twelve layers the gap grows to about `2.06e5`. Pre-LN's gradient remains distributed across all twelve blocks. Post-LN's first eleven blocks sit between `1.0e-7` and `1.3e-6` while the last block stays near `1.8e-01`.
 
 ## Design decisions
 
