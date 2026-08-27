@@ -213,7 +213,7 @@ At twelve layers the gap grows to about `2.06e5`. Pre-LN's gradient remains dist
 - The probe loss is output energy, not cross-entropy. The two variants also produce differently scaled outputs because post-LN normalizes at the end of each block. The per-block norms are the fair part of the comparison; the absolute losses are descriptive.
 - The diagnostic stack has no final LayerNorm, no LM head, no positional encoding, and no tokenizer.
 - Only float32 CPU is measured. Float64 is used in arithmetic tests, but mixed precision and GPU numerics are not claimed.
-- The ordering is depth-dependent. A one-block stack can reverse it; the probe therefore requires at least two blocks and defaults to six.
+- The ordering is depth-dependent. The probe therefore requires at least two blocks and defaults to six; a single block is not a meaningful depth comparison.
 - Pre-LN is not universally better. This probe shows why post-LN is warmup-sensitive; it does not show that pre-LN trains to a better model.
 - No KV cache, FlashAttention, RMSNorm, rotary/ALiBi positions, padding mask, or cross-attention is implemented. The block is the decoder self-attention unit, not a full GPT.
 - PyTorch emits a harmless `Failed to initialize NumPy` warning because NumPy is intentionally absent.
