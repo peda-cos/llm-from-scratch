@@ -9,8 +9,11 @@ normalization-placement difference measurable without a training run.
 
 from __future__ import annotations
 
+import argparse
 import math
-from typing import Literal, overload
+import sys
+from collections.abc import Sequence
+from typing import Literal, NamedTuple, cast, overload
 
 import torch
 from torch import Tensor, nn
@@ -418,5 +421,304 @@ class _DiagnosticStack(nn.Module):
         for block in self.blocks:
             hidden = block(hidden)
         return hidden
+
+
+class GradientProbe(NamedTuple):
+    pre_output_shape: tuple[int, ...]
+    post_output_shape: tuple[int, ...]
+    pre_probe_loss: float
+    post_probe_loss: float
+    pre_embedding_grad_norm: float
+    post_embedding_grad_norm: float
+    embedding_grad_ratio: float
+    pre_block_grad_norms: tuple[float, ...]
+    post_block_grad_norms: tuple[float, ...]
+    max_output_difference: float
+    causal_future_weight_max: float
+    causal_row_sum_max_error: float
+    pre_parameter_count: int
+    post_parameter_count: int
+
+
+def _require_finite(tensor: Tensor, name: str) -> None:
+    if not bool(torch.isfinite(tensor).all()):
+        raise AssertionError(f"{name} contains non-finite values")
+
+
+def _embedding_grad_norm(stack: _DiagnosticStack) -> float:
+    gradient = stack.embedding.weight.grad
+    if gradient is None:
+        raise AssertionError("embedding gradient is missing")
+    _require_finite(gradient, "embedding gradient")
+    norm = float(gradient.norm())
+    if norm <= 0:
+        raise AssertionError("embedding gradient norm must be positive")
+    return norm
+
+
+def _block_grad_norm(block: nn.Module) -> float:
+    total = 0.0
+    for parameter in block.parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            raise AssertionError("a block parameter did not receive a gradient")
+        _require_finite(gradient, "block parameter gradient")
+        total += float(gradient.norm()) ** 2
+    norm = math.sqrt(total)
+    if not math.isfinite(norm):
+        raise AssertionError("block gradient norm is not finite")
+    return norm
+
+
+def _probe_stack(
+    stack: _DiagnosticStack, ids: Tensor
+) -> tuple[Tensor, float, float, tuple[float, ...]]:
+    stack.eval()
+    stack.zero_grad(set_to_none=True)
+    output = stack(ids)
+    _require_finite(output, "stack output")
+    loss = output.square().mean()
+    loss.backward()
+    embedding_norm = _embedding_grad_norm(stack)
+    block_norms = tuple(_block_grad_norm(block) for block in stack.blocks)
+    return output, float(loss.detach()), embedding_norm, block_norms
+
+
+def gradient_probe(
+    *,
+    d_model: int,
+    num_heads: int,
+    num_layers: int,
+    max_context_length: int,
+    batch_size: int,
+    vocabulary_size: int,
+    seed: int = 1234,
+) -> GradientProbe:
+    """Compare pre-LN and post-LN at initialization with one backward pass."""
+    d_model = _require_positive_int("d_model", d_model)
+    num_heads = _require_positive_int("num_heads", num_heads)
+    num_layers = _require_positive_int("num_layers", num_layers)
+    max_context_length = _require_positive_int(
+        "max_context_length", max_context_length
+    )
+    batch_size = _require_positive_int("batch_size", batch_size)
+    vocabulary_size = _require_positive_int("vocabulary_size", vocabulary_size)
+    seed_value = _require_seed(seed)
+    if seed_value is None:
+        raise TypeError("seed must be an int")
+
+    if num_layers < 2:
+        raise ValueError(
+            "num_layers must be >= 2 for the pre/post gradient comparison"
+        )
+    if max_context_length < 2:
+        raise ValueError("max_context_length must be >= 2")
+    if vocabulary_size < 2:
+        raise ValueError("vocabulary_size must be >= 2")
+    if d_model % num_heads != 0:
+        raise ValueError(
+            "d_model must be divisible by num_heads: "
+            f"{d_model} % {num_heads} != 0"
+        )
+    if num_heads > d_model:
+        raise ValueError("num_heads must be <= d_model")
+
+    pre = _DiagnosticStack(
+        d_model,
+        num_heads,
+        num_layers,
+        max_context_length,
+        vocabulary_size,
+        pre_ln=True,
+        seed=seed_value,
+    )
+    post = _DiagnosticStack(
+        d_model,
+        num_heads,
+        num_layers,
+        max_context_length,
+        vocabulary_size,
+        pre_ln=False,
+        seed=seed_value,
+    )
+    post.load_state_dict(pre.state_dict(), strict=True)
+
+    ids = torch.randint(
+        0,
+        vocabulary_size,
+        (batch_size, max_context_length),
+        generator=torch.Generator().manual_seed(seed_value + 7),
+    )
+    pre_output, pre_loss, pre_norm, pre_block_norms = _probe_stack(pre, ids)
+    post_output, post_loss, post_norm, post_block_norms = _probe_stack(post, ids)
+
+    if pre_output.shape != post_output.shape:
+        raise AssertionError("pre-LN and post-LN output shapes differ")
+    max_output_difference = float(
+        (pre_output.detach() - post_output.detach()).abs().max()
+    )
+    if max_output_difference == 0.0:
+        raise AssertionError("pre-LN and post-LN produced identical outputs")
+
+    first_block = cast(TransformerBlock, pre.blocks[0])
+    with torch.no_grad():
+        attention_input = first_block.norm1(pre.embedding(ids))
+        _, weights = first_block.attention(attention_input, return_weights=True)
+    causal_future_weight_max = float(
+        torch.triu(weights, diagonal=1).abs().max()
+    )
+    causal_row_sum_max_error = float(
+        (weights.sum(dim=-1) - 1.0).abs().max()
+    )
+    if causal_future_weight_max != 0.0:
+        raise AssertionError("causal mask leaked future attention weight")
+    if causal_row_sum_max_error > 1e-5:
+        raise AssertionError("attention rows do not sum to one")
+
+    return GradientProbe(
+        pre_output_shape=tuple(pre_output.shape),
+        post_output_shape=tuple(post_output.shape),
+        pre_probe_loss=pre_loss,
+        post_probe_loss=post_loss,
+        pre_embedding_grad_norm=pre_norm,
+        post_embedding_grad_norm=post_norm,
+        embedding_grad_ratio=pre_norm / post_norm,
+        pre_block_grad_norms=pre_block_norms,
+        post_block_grad_norms=post_block_norms,
+        max_output_difference=max_output_difference,
+        causal_future_weight_max=causal_future_weight_max,
+        causal_row_sum_max_error=causal_row_sum_max_error,
+        pre_parameter_count=parameter_count(pre),
+        post_parameter_count=parameter_count(post),
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Pre-LN vs post-LN transformer block gradient probe."
+        )
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="demo",
+        choices=("demo",),
+        help="command to run (default: demo)",
+    )
+    parser.add_argument("--d-model", type=int, default=128, help="model dimension")
+    parser.add_argument("--heads", type=int, default=4, help="attention heads")
+    parser.add_argument("--layers", type=int, default=6, help="blocks per stack")
+    parser.add_argument(
+        "--context-length", type=int, default=16, help="tokens per sequence"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=4, help="sequences per probe"
+    )
+    parser.add_argument(
+        "--vocab-size", type=int, default=256, help="synthetic vocabulary size"
+    )
+    parser.add_argument("--seed", type=int, default=1234, help="base seed")
+    return parser
+
+
+def _run_demo(args: argparse.Namespace) -> int:
+    try:
+        d_model = _require_positive_int("d_model", args.d_model)
+        num_heads = _require_positive_int("num_heads", args.heads)
+        num_layers = _require_positive_int("num_layers", args.layers)
+        context_length = _require_positive_int(
+            "max_context_length", args.context_length
+        )
+        batch_size = _require_positive_int("batch_size", args.batch_size)
+        vocabulary_size = _require_positive_int(
+            "vocabulary_size", args.vocab_size
+        )
+        seed_value = _require_seed(args.seed)
+        if seed_value is None:
+            raise TypeError("seed must be an int")
+        if num_layers < 2:
+            raise ValueError(
+                "num_layers must be >= 2 for the pre/post gradient comparison"
+            )
+        if context_length < 2:
+            raise ValueError("max_context_length must be >= 2")
+        if vocabulary_size < 2:
+            raise ValueError("vocabulary_size must be >= 2")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by num_heads: "
+                f"{d_model} % {num_heads} != 0"
+            )
+        if num_heads > d_model:
+            raise ValueError("num_heads must be <= d_model")
+        probe = gradient_probe(
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            max_context_length=context_length,
+            batch_size=batch_size,
+            vocabulary_size=vocabulary_size,
+            seed=seed_value,
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print("transformer block gradient probe")
+    print(
+        f"config: layers={num_layers} d_model={d_model} "
+        f"num_heads={num_heads} head_dim={d_model // num_heads} "
+        f"max_context_length={context_length} batch_size={batch_size} "
+        f"vocabulary_size={vocabulary_size} seed={seed_value}"
+    )
+    print(
+        "probe: loss=output.square().mean(), dropout=0.0, no final norm, "
+        "identical token ids and copied weights"
+    )
+    print(
+        f"pre_ln: output_shape={probe.pre_output_shape} "
+        f"embedding_grad_norm={probe.pre_embedding_grad_norm:.6e} "
+        f"probe_loss={probe.pre_probe_loss:.6e}"
+    )
+    print(
+        f"post_ln: output_shape={probe.post_output_shape} "
+        f"embedding_grad_norm={probe.post_embedding_grad_norm:.6e} "
+        f"probe_loss={probe.post_probe_loss:.6e}"
+    )
+    print(f"embedding_grad_ratio={probe.embedding_grad_ratio:.6e}")
+    print(f"max_output_difference={probe.max_output_difference:.6e}")
+    pre_block_text = " ".join(
+        f"block_{index}={norm:.6e}"
+        for index, norm in enumerate(probe.pre_block_grad_norms)
+    )
+    post_block_text = " ".join(
+        f"block_{index}={norm:.6e}"
+        for index, norm in enumerate(probe.post_block_grad_norms)
+    )
+    print(f"pre_ln block_grad_norms: {pre_block_text}")
+    print(f"post_ln block_grad_norms: {post_block_text}")
+    print(
+        f"causal_check: future_weight_max={probe.causal_future_weight_max:.1f} "
+        f"row_sum_max_error={probe.causal_row_sum_max_error:.2e}"
+    )
+    print(
+        f"parameter_counts: pre_ln={probe.pre_parameter_count} "
+        f"post_ln={probe.post_parameter_count}"
+    )
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command != "demo":
+        parser.error(f"unknown command: {args.command}")
+    return _run_demo(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
 
 
