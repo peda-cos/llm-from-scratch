@@ -9,9 +9,13 @@ parameters and generates synthetic token ids offline.
 
 from __future__ import annotations
 
+import argparse
 import math
-from dataclasses import dataclass
-from typing import Protocol, cast
+import sys
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import NamedTuple, Protocol, cast
 
 import torch
 from torch import Tensor, nn
@@ -657,3 +661,319 @@ def generate(
         if module is not None and was_training:
             module.train()
     return result
+
+
+REFERENCE_GPT2_SMALL_PARAMETERS = 124_000_000
+
+
+class AssemblyReport(NamedTuple):
+    parameters: int
+    untied_parameters: int
+    reference_parameters: int
+    lm_head_shared: bool
+    forward_shape: tuple[int, ...]
+    forward_ms: float
+
+
+class TinyReport(NamedTuple):
+    parameters: int
+    lm_head_shared: bool
+    prompt_ids: tuple[int, ...]
+    generated_ids: tuple[int, ...]
+    repeat_match: bool
+
+
+def build_assembly_report(
+    config: GPTConfig, *, seed: int, forward_length: int = 8
+) -> AssemblyReport:
+    """Count parameters and run one timed forward pass for a configuration."""
+    if not isinstance(config, GPTConfig):
+        raise TypeError("config must be a GPTConfig")
+    seed_value = _require_seed(seed)
+    if seed_value is None:
+        raise TypeError("seed must be an int")
+    forward_length_value = _require_positive_int(
+        "forward_length", forward_length
+    )
+
+    model = GPTModel(config, seed=seed_value)
+    parameters = count_parameters(model)
+    lm_head_shared = model.lm_head.weight is model.token_embedding.weight
+
+    with torch.device("meta"):
+        untied = GPTModel(
+            replace(config, weight_tying=False), seed=seed_value
+        )
+    untied_parameters = count_parameters(untied)
+
+    length = min(forward_length_value, config.context_length)
+    ids = (
+        torch.arange(length, dtype=torch.long).unsqueeze(0)
+        % config.vocab_size
+    )
+    model.eval()
+    with torch.no_grad():
+        start = time.perf_counter()
+        logits = model(ids)
+        forward_ms = (time.perf_counter() - start) * 1000.0
+    forward_shape = tuple(logits.shape)
+    if forward_shape != (1, length, config.vocab_size):
+        raise AssertionError(
+            f"unexpected forward shape {forward_shape}"
+        )
+    return AssemblyReport(
+        parameters=parameters,
+        untied_parameters=untied_parameters,
+        reference_parameters=REFERENCE_GPT2_SMALL_PARAMETERS,
+        lm_head_shared=lm_head_shared,
+        forward_shape=forward_shape,
+        forward_ms=forward_ms,
+    )
+
+
+def run_tiny_demo(
+    config: GPTConfig,
+    *,
+    seed: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int | None,
+    greedy: bool,
+) -> TinyReport:
+    """Run the small end-to-end generation path twice for reproducibility."""
+    if not isinstance(config, GPTConfig):
+        raise TypeError("config must be a GPTConfig")
+    seed_value = _require_seed(seed)
+    if seed_value is None:
+        raise TypeError("seed must be an int")
+    if config.vocab_size < 5:
+        raise ValueError(
+            "tiny vocab_size must be >= 5 for the fixed prompt"
+        )
+    max_new_tokens_value = _require_nonnegative_int(
+        "max_new_tokens", max_new_tokens
+    )
+    temperature_value = _require_nonnegative_float(
+        "temperature", temperature
+    )
+    top_k_value = (
+        None if top_k is None else _require_positive_int("top_k", top_k)
+    )
+    greedy_value = _require_bool("greedy", greedy)
+
+    model = GPTModel(config, seed=seed_value)
+    prompt_ids = (1, 2, 3, 4)
+    prompt = torch.tensor([prompt_ids], dtype=torch.long)
+
+    def run_once() -> Tensor:
+        generator = torch.Generator(device="cpu").manual_seed(
+            seed_value + 17
+        )
+        return generate(
+            model,
+            prompt,
+            max_new_tokens=max_new_tokens_value,
+            temperature=temperature_value,
+            top_k=top_k_value,
+            greedy=greedy_value,
+            generator=generator,
+        )
+
+    generated = run_once()
+    repeated = run_once()
+    repeat_match = torch.equal(generated, repeated)
+    if not repeat_match:
+        raise RuntimeError(
+            "generation was not reproducible with a fixed seed"
+        )
+    generated_ids = tuple(
+        int(value) for value in generated[0].tolist()
+    )
+    return TinyReport(
+        parameters=count_parameters(model),
+        lm_head_shared=(
+            model.lm_head.weight is model.token_embedding.weight
+        ),
+        prompt_ids=prompt_ids,
+        generated_ids=generated_ids,
+        repeat_match=repeat_match,
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Assemble a 124M GPT-2-style model, count parameters, and "
+            "generate synthetic token ids."
+        )
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="demo",
+        choices=("demo",),
+        help="command to run (default: demo)",
+    )
+    parser.add_argument("--seed", type=int, default=1234, help="base seed")
+    parser.add_argument(
+        "--forward-length",
+        type=int,
+        default=8,
+        help="tokens in the single 124M forward pass",
+    )
+    parser.add_argument(
+        "--tiny-only",
+        action="store_true",
+        help="skip the 124M report and run only the small demo",
+    )
+    parser.add_argument(
+        "--tiny-vocab-size", type=int, default=256, help="tiny vocabulary"
+    )
+    parser.add_argument(
+        "--tiny-context-length",
+        type=int,
+        default=32,
+        help="tiny context length",
+    )
+    parser.add_argument(
+        "--tiny-d-model", type=int, default=64, help="tiny model dimension"
+    )
+    parser.add_argument(
+        "--tiny-heads", type=int, default=4, help="tiny attention heads"
+    )
+    parser.add_argument(
+        "--tiny-layers", type=int, default=2, help="tiny block count"
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=8,
+        help="tokens generated by the tiny demo",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="sampling temperature; 0 means greedy",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=40,
+        help="top-k truncation; values >= vocabulary disable it",
+    )
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="use argmax instead of multinomial sampling",
+    )
+    return parser
+
+
+def _run_demo(args: argparse.Namespace) -> int:
+    try:
+        seed_value = _require_seed(args.seed)
+        if seed_value is None:
+            raise TypeError("seed must be an int")
+        tiny_config = replace(
+            GPTConfig(),
+            vocab_size=args.tiny_vocab_size,
+            context_length=args.tiny_context_length,
+            d_model=args.tiny_d_model,
+            num_heads=args.tiny_heads,
+            num_layers=args.tiny_layers,
+            dropout=0.0,
+        )
+        if tiny_config.vocab_size < 5:
+            raise ValueError(
+                "tiny vocab_size must be >= 5 for the fixed prompt"
+            )
+        max_new_tokens_value = _require_nonnegative_int(
+            "max_new_tokens", args.max_new_tokens
+        )
+        temperature_value = _require_nonnegative_float(
+            "temperature", args.temperature
+        )
+        top_k_value = _require_positive_int("top_k", args.top_k)
+        greedy_value = _require_bool("greedy", args.greedy)
+
+        if not args.tiny_only:
+            large_config = GPTConfig()
+            report = build_assembly_report(
+                large_config,
+                seed=seed_value,
+                forward_length=args.forward_length,
+            )
+            print("gpt model assembly")
+            print(
+                f"large: parameters={report.parameters} "
+                f"({report.parameters / 1_000_000:.2f}M; "
+                "reference GPT-2 small ~124M)"
+            )
+            print(
+                f"large: reference_parameters={report.reference_parameters} "
+                f"rounded_delta="
+                f"{report.parameters - report.reference_parameters}"
+            )
+            print(
+                "large: tied_delta_vs_untied="
+                f"{report.untied_parameters - report.parameters} "
+                f"expected="
+                f"{large_config.vocab_size * large_config.d_model}"
+            )
+            print(
+                "large: lm_head_shares_token_embedding="
+                f"{report.lm_head_shared}"
+            )
+            print(
+                f"large: forward_shape={report.forward_shape} "
+                f"forward_ms={report.forward_ms:.3f}"
+            )
+
+        tiny_report = run_tiny_demo(
+            tiny_config,
+            seed=seed_value,
+            max_new_tokens=max_new_tokens_value,
+            temperature=temperature_value,
+            top_k=top_k_value,
+            greedy=greedy_value,
+        )
+        print(
+            f"tiny: config=vocab_size={tiny_config.vocab_size} "
+            f"context_length={tiny_config.context_length} "
+            f"d_model={tiny_config.d_model} "
+            f"num_heads={tiny_config.num_heads} "
+            f"num_layers={tiny_config.num_layers} "
+            f"mlp_expansion={tiny_config.mlp_expansion} "
+            f"dropout={tiny_config.dropout} "
+            f"use_bias={tiny_config.use_bias} "
+            f"weight_tying={tiny_config.weight_tying}"
+        )
+        print(f"tiny: parameters={tiny_report.parameters}")
+        print(
+            "tiny: lm_head_shares_token_embedding="
+            f"{tiny_report.lm_head_shared}"
+        )
+        print(f"tiny: prompt_ids={list(tiny_report.prompt_ids)}")
+        print(f"tiny: generated_ids={list(tiny_report.generated_ids)}")
+        new_ids = list(
+            tiny_report.generated_ids[len(tiny_report.prompt_ids):]
+        )
+        print(f"tiny: new_ids={new_ids}")
+        print(f"tiny: repeat_match={tiny_report.repeat_match}")
+    except (TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command != "demo":
+        parser.error(f"unknown command: {args.command}")
+    return _run_demo(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
