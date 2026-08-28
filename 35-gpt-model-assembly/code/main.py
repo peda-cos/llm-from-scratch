@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import cast
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor, nn
@@ -537,3 +537,123 @@ class GPTModel(nn.Module):
         x = self.final_norm(x)
         logits: Tensor = self.lm_head(x)
         return logits
+
+
+class LogitsSource(Protocol):
+    """Anything that maps token ids to vocabulary logits."""
+
+    @property
+    def context_length(self) -> int: ...
+
+    def __call__(self, idx: Tensor) -> Tensor: ...
+
+
+def sample_next_token(
+    logits: Tensor,
+    *,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    greedy: bool = False,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Sample one token per batch row from last-position logits."""
+    if logits.ndim != 2:
+        raise ValueError(
+            f"logits must have shape (B, V), got {tuple(logits.shape)}"
+        )
+    if not logits.is_floating_point():
+        raise TypeError(
+            f"logits must be a floating-point tensor, got {logits.dtype}"
+        )
+    if logits.shape[0] < 1 or logits.shape[1] < 1:
+        raise ValueError("logits batch and vocabulary dimensions must be >= 1")
+    greedy_value = _require_bool("greedy", greedy)
+    temperature_value = _require_nonnegative_float(
+        "temperature", temperature
+    )
+    top_k_value = (
+        None if top_k is None else _require_positive_int("top_k", top_k)
+    )
+    if not bool(torch.isfinite(logits).all()):
+        raise ValueError("logits must be finite")
+
+    if greedy_value or temperature_value == 0.0:
+        return logits.argmax(dim=-1, keepdim=True)
+
+    scaled = logits / temperature_value
+    if not bool(torch.isfinite(scaled).all()):
+        raise ValueError("temperature is too small for the logit range")
+    if top_k_value is not None and top_k_value < scaled.shape[-1]:
+        values, indices = torch.topk(scaled, top_k_value, dim=-1)
+        filtered = torch.full_like(scaled, float("-inf"))
+        filtered.scatter_(1, indices, values)
+        scaled = filtered
+
+    probabilities = torch.softmax(scaled, dim=-1)
+    return torch.multinomial(
+        probabilities, num_samples=1, generator=generator
+    )
+
+
+def generate(
+    model: LogitsSource,
+    idx: Tensor,
+    *,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    greedy: bool = False,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Autoregressively sample tokens, sliding the active context window."""
+    _validate_token_input(idx, None)
+    max_new_tokens_value = _require_nonnegative_int(
+        "max_new_tokens", max_new_tokens
+    )
+    temperature_value = _require_nonnegative_float(
+        "temperature", temperature
+    )
+    top_k_value = (
+        None if top_k is None else _require_positive_int("top_k", top_k)
+    )
+    greedy_value = _require_bool("greedy", greedy)
+    context_length = _require_positive_int(
+        "model.context_length", model.context_length
+    )
+    if max_new_tokens_value == 0:
+        return idx.clone()
+
+    module = model if isinstance(model, nn.Module) else None
+    was_training = module.training if module is not None else False
+    if module is not None:
+        module.eval()
+
+    result = idx
+    try:
+        with torch.no_grad():
+            for _ in range(max_new_tokens_value):
+                idx_cond = result[:, -context_length:]
+                logits = model(idx_cond)
+                if logits.ndim != 3:
+                    raise ValueError(
+                        "model must return logits with shape (B, T, V), "
+                        f"got {tuple(logits.shape)}"
+                    )
+                if logits.shape[:2] != idx_cond.shape:
+                    raise ValueError(
+                        "model logits batch/sequence shape does not match "
+                        f"input: {tuple(logits.shape[:2])} vs "
+                        f"{tuple(idx_cond.shape)}"
+                    )
+                next_token = sample_next_token(
+                    logits[:, -1, :],
+                    temperature=temperature_value,
+                    top_k=top_k_value,
+                    greedy=greedy_value,
+                    generator=generator,
+                )
+                result = torch.cat((result, next_token), dim=1)
+    finally:
+        if module is not None and was_training:
+            module.train()
+    return result
