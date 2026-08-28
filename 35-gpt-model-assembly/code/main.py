@@ -10,6 +10,8 @@ parameters and generates synthetic token ids offline.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -407,3 +409,131 @@ class TransformerBlock(nn.Module):
         x = x + self.attention(self.norm1(x))
         x = x + self.feed_forward(self.norm2(x))
         return x
+
+
+@dataclass(frozen=True)
+class GPTConfig:
+    """GPT-2-small shape with tied token embedding and LM head by default."""
+
+    vocab_size: int = 50257
+    context_length: int = 1024
+    d_model: int = 768
+    num_heads: int = 12
+    num_layers: int = 12
+    mlp_expansion: int = 4
+    dropout: float = 0.1
+    use_bias: bool = True
+    weight_tying: bool = True
+
+    def __post_init__(self) -> None:
+        _require_positive_int("vocab_size", self.vocab_size)
+        _require_positive_int("context_length", self.context_length)
+        _require_positive_int("d_model", self.d_model)
+        _require_positive_int("num_heads", self.num_heads)
+        _require_positive_int("num_layers", self.num_layers)
+        _require_positive_int("mlp_expansion", self.mlp_expansion)
+        _require_probability("dropout", self.dropout)
+        _require_bool("use_bias", self.use_bias)
+        _require_bool("weight_tying", self.weight_tying)
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by num_heads: "
+                f"{self.d_model} % {self.num_heads} != 0"
+            )
+
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.num_heads
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Count unique scalar parameters, honoring parameter-level weight tying."""
+    seen: set[int] = set()
+    total = 0
+    for parameter in model.parameters():
+        identity = id(parameter)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        total += parameter.numel()
+    return total
+
+
+class GPTModel(nn.Module):
+    """Token/position embeddings, pre-LN blocks, final norm, and a tied head."""
+
+    config: GPTConfig
+    token_embedding: nn.Embedding
+    position_embedding: nn.Embedding
+    embedding_dropout: nn.Dropout
+    blocks: nn.ModuleList
+    final_norm: LayerNorm
+    lm_head: nn.Linear
+    position_ids: Tensor
+
+    def __init__(
+        self, config: GPTConfig, *, seed: int | None = None
+    ) -> None:
+        super().__init__()
+        if not isinstance(config, GPTConfig):
+            raise TypeError("config must be a GPTConfig")
+        seed_value = _require_seed(seed)
+        self.config = config
+
+        self.token_embedding = nn.Embedding(
+            config.vocab_size, config.d_model
+        )
+        self.position_embedding = nn.Embedding(
+            config.context_length, config.d_model
+        )
+        self.embedding_dropout = nn.Dropout(config.dropout)
+        generator = _make_generator(seed_value)
+        _init_embedding(self.token_embedding, 0.02, generator)
+        _init_embedding(self.position_embedding, 0.02, generator)
+
+        residual_std = 0.02 / math.sqrt(2 * config.num_layers)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    config.d_model,
+                    config.num_heads,
+                    config.context_length,
+                    mlp_expansion=config.mlp_expansion,
+                    use_bias=config.use_bias,
+                    dropout=config.dropout,
+                    residual_std=residual_std,
+                    seed=_seed_offset(seed_value, 2 + index),
+                )
+                for index in range(config.num_layers)
+            ]
+        )
+        self.final_norm = LayerNorm(config.d_model)
+        self.lm_head = nn.Linear(
+            config.d_model, config.vocab_size, bias=False
+        )
+        if config.weight_tying:
+            self.lm_head.weight = self.token_embedding.weight
+        else:
+            _init_linear(self.lm_head, 0.02, generator)
+        self.register_buffer(
+            "position_ids",
+            torch.arange(config.context_length, dtype=torch.long),
+            persistent=False,
+        )
+
+    @property
+    def context_length(self) -> int:
+        return self.config.context_length
+
+    def forward(self, idx: Tensor) -> Tensor:
+        _, length = _validate_token_input(idx, self.config.context_length)
+        token_vectors = self.token_embedding(idx)
+        position_vectors = self.position_embedding(
+            self.position_ids[:length]
+        )
+        x: Tensor = self.embedding_dropout(token_vectors + position_vectors)
+        for block in self.blocks:
+            x = cast(TransformerBlock, block)(x)
+        x = self.final_norm(x)
+        logits: Tensor = self.lm_head(x)
+        return logits
