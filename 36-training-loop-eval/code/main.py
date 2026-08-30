@@ -582,3 +582,80 @@ def generate_and_print_sample(
     shown = rows[0] if len(rows) == 1 else rows
     print(f"{prefix} ids={shown}", flush=True)
     return generated
+
+
+def make_batches(
+    token_ids: Tensor, batch_size: int, context_length: int
+) -> list[tuple[Tensor, Tensor]]:
+    """Slice a token tensor into full batches with targets shifted by one."""
+    if token_ids.ndim != 1:
+        raise ValueError(
+            f"token_ids must have shape (N,), got {tuple(token_ids.shape)}"
+        )
+    if token_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"token_ids must be an integer tensor, got {token_ids.dtype}"
+        )
+    batch_value = _require_int("batch_size", batch_size, minimum=1)
+    context_value = _require_int(
+        "context_length", context_length, minimum=1
+    )
+    required = batch_value * context_value + 1
+    if token_ids.numel() < required:
+        raise ValueError(
+            f"token_ids has {token_ids.numel()} tokens; at least {required} "
+            f"are required for batch_size={batch_value} and "
+            f"context_length={context_value}"
+        )
+
+    windows = (token_ids.numel() - context_value) // context_value
+    batches: list[tuple[Tensor, Tensor]] = []
+    for start_window in range(0, windows - batch_value + 1, batch_value):
+        inputs = torch.stack(
+            [
+                token_ids[
+                    (start_window + offset) * context_value :
+                    (start_window + offset + 1) * context_value
+                ]
+                for offset in range(batch_value)
+            ]
+        )
+        targets = torch.stack(
+            [
+                token_ids[
+                    (start_window + offset) * context_value + 1 :
+                    (start_window + offset + 1) * context_value + 1
+                ]
+                for offset in range(batch_value)
+            ]
+        )
+        batches.append((inputs, targets))
+    return batches
+
+
+def calc_loss_batch(
+    model: nn.Module, inputs: Tensor, targets: Tensor
+) -> Tensor:
+    """Flatten logits and pre-shifted targets into one cross-entropy loss."""
+    _validate_token_ids("inputs", inputs)
+    _validate_token_ids("targets", targets)
+    if inputs.shape != targets.shape:
+        raise ValueError(
+            f"inputs shape {tuple(inputs.shape)} does not match targets "
+            f"shape {tuple(targets.shape)}"
+        )
+    logits = model(inputs)
+    if logits.ndim != 3:
+        raise ValueError(
+            f"model logits must have shape (B, T, V), got "
+            f"{tuple(logits.shape)}"
+        )
+    if logits.shape[:2] != inputs.shape:
+        raise ValueError(
+            f"model logits batch/sequence shape {tuple(logits.shape[:2])} "
+            f"does not match inputs {tuple(inputs.shape)}"
+        )
+    loss: Tensor = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]), targets.reshape(-1)
+    )
+    return loss
