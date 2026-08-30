@@ -709,3 +709,251 @@ def build_param_groups(
         {"params": decay, "weight_decay": decay_value},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    """Optimization and probe settings for one training run."""
+
+    steps: int = 160
+    eval_every: int = 40
+    eval_batches: int = 4
+    warmup_steps: int = 16
+    max_lr: float = 3e-3
+    min_lr: float = 3e-4
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+    seed: int = 1234
+    sample_prompt: tuple[int, ...] = (1, 2, 3, 4)
+    sample_new_tokens: int = 12
+
+    def __post_init__(self) -> None:
+        steps = _require_int("steps", self.steps, minimum=1)
+        _require_int("eval_every", self.eval_every, minimum=1)
+        _require_int("eval_batches", self.eval_batches, minimum=1)
+        warmup_steps = _require_int(
+            "warmup_steps", self.warmup_steps, minimum=0
+        )
+        if warmup_steps >= steps:
+            raise ValueError(
+                f"warmup_steps ({warmup_steps}) must be less than "
+                f"steps ({steps})"
+            )
+        max_lr = _require_float("max_lr", self.max_lr, minimum=0.0)
+        if max_lr == 0.0:
+            raise ValueError("max_lr must be > 0")
+        min_lr = _require_float("min_lr", self.min_lr, minimum=0.0)
+        if min_lr > max_lr:
+            raise ValueError("min_lr must be <= max_lr")
+        _require_float(
+            "weight_decay", self.weight_decay, minimum=0.0
+        )
+        grad_clip = _require_float(
+            "grad_clip", self.grad_clip, minimum=0.0
+        )
+        if grad_clip == 0.0:
+            raise ValueError("grad_clip must be > 0")
+        _require_int("seed", self.seed, minimum=0)
+        if not isinstance(self.sample_prompt, tuple):
+            raise TypeError("sample_prompt must be a tuple of ints")
+        if not self.sample_prompt:
+            raise ValueError("sample_prompt must not be empty")
+        for token in self.sample_prompt:
+            _require_int("sample_prompt token", token, minimum=0)
+        _require_int(
+            "sample_new_tokens", self.sample_new_tokens, minimum=0
+        )
+
+
+class TrainResult(NamedTuple):
+    log_path: Path
+    train_losses: tuple[float, ...]
+    lr_values: tuple[float, ...]
+    grad_norms: tuple[float, ...]
+    eval_losses: tuple[tuple[int, float], ...]
+    samples: tuple[tuple[int, tuple[int, ...]], ...]
+    elapsed_seconds: float
+
+
+def cosine_with_warmup(
+    step: int,
+    warmup_steps: int,
+    total_steps: int,
+    max_lr: float,
+    min_lr: float,
+) -> float:
+    """Linear warmup into cosine decay, with a configurable LR floor."""
+    step_value = _require_int("step", step, minimum=0)
+    warmup_value = _require_int("warmup_steps", warmup_steps, minimum=0)
+    total_value = _require_int("total_steps", total_steps, minimum=1)
+    if warmup_value >= total_value:
+        raise ValueError(
+            f"warmup_steps ({warmup_value}) must be less than "
+            f"total_steps ({total_value})"
+        )
+    max_value = _require_float("max_lr", max_lr, minimum=0.0)
+    if max_value == 0.0:
+        raise ValueError("max_lr must be > 0")
+    min_value = _require_float("min_lr", min_lr, minimum=0.0)
+    if min_value > max_value:
+        raise ValueError("min_lr must be <= max_lr")
+
+    if step_value < warmup_value:
+        return max_value * step_value / warmup_value
+    if step_value >= total_value:
+        return min_value
+    progress = (step_value - warmup_value) / (total_value - warmup_value)
+    return min_value + 0.5 * (max_value - min_value) * (
+        1.0 + math.cos(math.pi * progress)
+    )
+
+
+def _validate_batch_sequence(
+    name: str, batches: Sequence[tuple[Tensor, Tensor]]
+) -> None:
+    if len(batches) == 0:
+        raise ValueError(f"{name} must contain at least one batch")
+    for index, pair in enumerate(batches):
+        inputs, targets = pair
+        _validate_token_ids(f"{name}[{index}] inputs", inputs)
+        _validate_token_ids(f"{name}[{index}] targets", targets)
+        if inputs.shape != targets.shape:
+            raise ValueError(
+                f"{name}[{index}] inputs shape {tuple(inputs.shape)} "
+                f"does not match targets shape {tuple(targets.shape)}"
+            )
+
+
+def train(
+    model: nn.Module,
+    train_batches: Sequence[tuple[Tensor, Tensor]],
+    val_batches: Sequence[tuple[Tensor, Tensor]],
+    config: TrainConfig,
+    log_path: Path | str,
+) -> TrainResult:
+    """Run measured optimization steps and persist one JSONL record each."""
+    if not isinstance(config, TrainConfig):
+        raise TypeError("config must be a TrainConfig")
+    if not isinstance(log_path, (str, Path)):
+        raise TypeError("log_path must be a path or string")
+    _validate_batch_sequence("train_batches", train_batches)
+    _validate_batch_sequence("val_batches", val_batches)
+    if len(val_batches) < config.eval_batches:
+        raise ValueError(
+            f"val_batches has {len(val_batches)} batches; "
+            f"eval_batches={config.eval_batches} requested"
+        )
+
+    output_path = Path(log_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    optimizer = torch.optim.AdamW(
+        build_param_groups(model, config.weight_decay),
+        lr=config.max_lr,
+    )
+    order_generator = torch.Generator().manual_seed(config.seed)
+    order: list[int] = []
+    order_position = 0
+    train_losses: list[float] = []
+    lr_values: list[float] = []
+    grad_norms: list[float] = []
+    eval_losses: list[tuple[int, float]] = []
+    samples: list[tuple[int, tuple[int, ...]]] = []
+    sample_device = train_batches[0][0].device
+
+    model.train()
+    started = time.perf_counter()
+    with output_path.open("w", encoding="utf-8") as log:
+        for step in range(1, config.steps + 1):
+            lr = cosine_with_warmup(
+                step,
+                config.warmup_steps,
+                config.steps,
+                config.max_lr,
+                config.min_lr,
+            )
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
+            if order_position >= len(order):
+                order = [
+                    int(index)
+                    for index in torch.randperm(
+                        len(train_batches), generator=order_generator
+                    ).tolist()
+                ]
+                order_position = 0
+            inputs, targets = train_batches[order[order_position]]
+            order_position += 1
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = calc_loss_batch(model, inputs, targets)
+            loss_value = float(loss.item())
+            if not math.isfinite(loss_value):
+                raise RuntimeError(
+                    f"non-finite training loss at step {step}: {loss_value}"
+                )
+            torch.autograd.backward(loss)
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config.grad_clip,
+                    error_if_nonfinite=True,
+                )
+            )
+            optimizer.step()
+
+            train_losses.append(loss_value)
+            lr_values.append(lr)
+            grad_norms.append(grad_norm)
+            log.write(
+                json.dumps(
+                    {
+                        "step": step,
+                        "train_loss": loss_value,
+                        "lr": lr,
+                    }
+                )
+                + "\n"
+            )
+            log.flush()
+            print(
+                f"step={step:03d} lr={lr:.6f} "
+                f"train_loss={loss_value:.4f} grad_norm={grad_norm:.3f}",
+                flush=True,
+            )
+
+            if step % config.eval_every == 0 or step == config.steps:
+                eval_loss = evaluate_model(
+                    model, val_batches, config.eval_batches
+                )
+                eval_losses.append((step, eval_loss))
+                print(
+                    f"eval step={step:03d} loss={eval_loss:.4f}",
+                    flush=True,
+                )
+                prompt = torch.tensor(
+                    [list(config.sample_prompt)],
+                    dtype=torch.long,
+                    device=sample_device,
+                )
+                generated = generate_and_print_sample(
+                    model,
+                    prompt,
+                    config.sample_new_tokens,
+                    prefix=f"sample step={step:03d}",
+                )
+                generated_ids = tuple(
+                    int(token) for token in generated[0].tolist()
+                )
+                samples.append((step, generated_ids))
+                model.train()
+
+    return TrainResult(
+        log_path=output_path,
+        train_losses=tuple(train_losses),
+        lr_values=tuple(lr_values),
+        grad_norms=tuple(grad_norms),
+        eval_losses=tuple(eval_losses),
+        samples=tuple(samples),
+        elapsed_seconds=time.perf_counter() - started,
+    )
