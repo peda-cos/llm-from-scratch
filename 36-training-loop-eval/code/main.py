@@ -659,3 +659,53 @@ def calc_loss_batch(
         logits.reshape(-1, logits.shape[-1]), targets.reshape(-1)
     )
     return loss
+
+
+def evaluate_model(
+    model: nn.Module,
+    val_loader: Sequence[tuple[Tensor, Tensor]],
+    max_batches: int,
+) -> float:
+    """Average loss over a fixed number of held-out batches without grads."""
+    batch_count = _require_int("max_batches", max_batches, minimum=1)
+    if len(val_loader) < batch_count:
+        raise ValueError(
+            f"val_loader has {len(val_loader)} batches; "
+            f"max_batches={batch_count} requested"
+        )
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    try:
+        with torch.no_grad():
+            for index in range(batch_count):
+                inputs, targets = val_loader[index]
+                total += float(calc_loss_batch(model, inputs, targets).item())
+    finally:
+        model.train(was_training)
+    return total / batch_count
+
+
+def build_param_groups(
+    model: nn.Module, weight_decay: float
+) -> list[dict[str, Any]]:
+    """Split matrix-shaped parameters from 1-D scales and biases for AdamW."""
+    decay_value = _require_float(
+        "weight_decay", weight_decay, minimum=0.0
+    )
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    seen: set[int] = set()
+    for parameter in model.parameters():
+        identity = id(parameter)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if parameter.ndim >= 2:
+            decay.append(parameter)
+        else:
+            no_decay.append(parameter)
+    return [
+        {"params": decay, "weight_decay": decay_value},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
