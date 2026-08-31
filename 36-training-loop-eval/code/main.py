@@ -957,3 +957,168 @@ def train(
         samples=tuple(samples),
         elapsed_seconds=time.perf_counter() - started,
     )
+
+
+TOY_PHRASE: tuple[int, ...] = (1, 2, 3, 4, 1, 5)
+TOY_WORDS: tuple[str, ...] = (
+    "<pad>",
+    "the",
+    "cat",
+    "sat",
+    "on",
+    "mat",
+    "dog",
+    "ran",
+)
+DEMO_CONTEXT_LENGTH = 16
+
+
+@dataclass(frozen=True)
+class DemoSettings:
+    """Command-line settings for the deterministic synthetic demo."""
+
+    steps: int = 160
+    eval_every: int = 40
+    eval_batches: int = 4
+    batch_size: int = 8
+    output_path: Path = Path("outputs/losses.jsonl")
+    seed: int = 1234
+    max_new_tokens: int = 12
+
+    def __post_init__(self) -> None:
+        _require_int("steps", self.steps, minimum=1)
+        _require_int("eval_every", self.eval_every, minimum=1)
+        _require_int("eval_batches", self.eval_batches, minimum=1)
+        _require_int("batch_size", self.batch_size, minimum=1)
+        if not isinstance(self.output_path, Path):
+            raise TypeError("output_path must be a Path")
+        _require_int("seed", self.seed, minimum=0)
+        _require_int(
+            "max_new_tokens", self.max_new_tokens, minimum=0
+        )
+
+
+def make_synthetic_corpus(repetitions: int = 3000) -> Tensor:
+    """Build a deterministic periodic toy token stream."""
+    count = _require_int("repetitions", repetitions, minimum=1)
+    return torch.tensor(TOY_PHRASE * count, dtype=torch.long)
+
+
+def run_demo(settings: DemoSettings) -> TrainResult:
+    """Train the tiny model on the toy phrase and print measured evidence."""
+    if not isinstance(settings, DemoSettings):
+        raise TypeError("settings must be a DemoSettings")
+    corpus = make_synthetic_corpus()
+    split = int(corpus.numel() * 0.9)
+    train_tokens = corpus[:split]
+    val_tokens = corpus[split:]
+    train_batches = make_batches(
+        train_tokens, settings.batch_size, DEMO_CONTEXT_LENGTH
+    )
+    val_batches = make_batches(
+        val_tokens, settings.batch_size, DEMO_CONTEXT_LENGTH
+    )
+    warmup_steps = (
+        max(1, settings.steps // 10) if settings.steps >= 10 else 0
+    )
+    warmup_steps = min(warmup_steps, settings.steps - 1)
+    config = TrainConfig(
+        steps=settings.steps,
+        eval_every=settings.eval_every,
+        eval_batches=settings.eval_batches,
+        warmup_steps=warmup_steps,
+        seed=settings.seed,
+        sample_new_tokens=settings.max_new_tokens,
+    )
+    model = GPTModel(GPTConfig(), seed=settings.seed)
+    words = " ".join(TOY_WORDS[token] for token in TOY_PHRASE)
+
+    print("training loop and evaluation", flush=True)
+    print(
+        f"corpus: toy_phrase={list(TOY_PHRASE)} words=\"{words}\" "
+        f"vocab={len(TOY_WORDS)}",
+        flush=True,
+    )
+    print(
+        f"data: train_tokens={train_tokens.numel()} "
+        f"train_batches={len(train_batches)} "
+        f"val_tokens={val_tokens.numel()} val_batches={len(val_batches)}",
+        flush=True,
+    )
+    print(
+        f"model: parameters={count_parameters(model)} "
+        f"context_length={DEMO_CONTEXT_LENGTH} "
+        f"d_model={model.config.d_model} num_heads={model.config.num_heads} "
+        f"num_layers={model.config.num_layers}",
+        flush=True,
+    )
+    print(
+        f"train: steps={config.steps} batch_size={settings.batch_size} "
+        f"eval_every={config.eval_every} eval_batches={config.eval_batches} "
+        f"warmup_steps={config.warmup_steps} "
+        f"max_lr={config.max_lr:.6f} min_lr={config.min_lr:.6f} "
+        f"weight_decay={config.weight_decay} grad_clip={config.grad_clip}",
+        flush=True,
+    )
+    result = train(
+        model,
+        train_batches,
+        val_batches,
+        config,
+        settings.output_path,
+    )
+    best_eval = min(loss for _, loss in result.eval_losses)
+    print(
+        f"summary: first_train_loss={result.train_losses[0]:.4f} "
+        f"final_train_loss={result.train_losses[-1]:.4f} "
+        f"best_eval_loss={best_eval:.4f} "
+        f"eval_points={len(result.eval_losses)} "
+        f"elapsed_s={result.elapsed_seconds:.3f}",
+        flush=True,
+    )
+    print(
+        f"log: {result.log_path} records={len(result.train_losses)}",
+        flush=True,
+    )
+    return result
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a tiny GPT on a synthetic phrase and log per-step losses."
+        )
+    )
+    parser.add_argument("--steps", type=int, default=160)
+    parser.add_argument("--eval-every", type=int, default=40)
+    parser.add_argument("--eval-batches", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--output", type=Path, default=Path("outputs/losses.jsonl")
+    )
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--max-new-tokens", type=int, default=12)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        settings = DemoSettings(
+            steps=args.steps,
+            eval_every=args.eval_every,
+            eval_batches=args.eval_batches,
+            batch_size=args.batch_size,
+            output_path=args.output,
+            seed=args.seed,
+            max_new_tokens=args.max_new_tokens,
+        )
+        run_demo(settings)
+    except (TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
