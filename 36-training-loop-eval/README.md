@@ -178,12 +178,12 @@ Measured locally with Python 3.14.10, `torch==2.15.0+cpu`, `uv 0.13.9`, Linux x8
 ```text
 $ ./verify.sh
 ...
-24 passed, 1 warning in 2.69s
+25 passed, 1 warning in 2.80s
 Success: no issues found in 7 source files
 verify: ok
 ```
 
-A second consecutive run reported `24 passed` and `Success: no issues found in 7 source files`; the two verification runs took about 6.3 s and 6.6 s wall time. The warning is PyTorch's optional NumPy probe; NumPy is intentionally not a dependency. The 24 tests cover attention causality, tied parameter storage, greedy/top-k generation and mode restoration, shifted batching, manual cross-entropy equivalence, gradient flow, parameter-group classification, fixed-batch no-grad evaluation, schedule boundaries and monotonicity, JSONL schema and LR integration, deterministic learning, probe cadence, overwrite behavior, CLI validation, and corpus periodicity.
+A second consecutive run reported `25 passed` and `Success: no issues found in 7 source files`; the two verification runs took about 6.8 s and 6.5 s wall time. The warning is PyTorch's optional NumPy probe; NumPy is intentionally not a dependency. The 25 tests cover attention causality, tied parameter storage, greedy/top-k generation and mode restoration, shifted batching, manual cross-entropy equivalence, gradient flow, parameter-group classification, fixed-batch no-grad evaluation, schedule boundaries and monotonicity, JSONL schema and LR integration, deterministic learning, exact minimum-window batching, probe cadence, overwrite behavior, CLI validation, and corpus periodicity.
 
 ### Full demo
 
@@ -192,7 +192,7 @@ Command: `uv run --frozen python code/main.py`
 ```text
 training loop and evaluation
 corpus: toy_phrase=[1, 2, 3, 4, 1, 5] words="the cat sat on the mat" vocab=8
-data: train_tokens=16200 train_batches=126 val_tokens=1800 val_batches=13
+data: train_tokens=16200 train_batches=126 val_tokens=1800 val_batches=14
 model: parameters=26240 context_length=16 d_model=32 num_heads=4 num_layers=2
 train: steps=160 batch_size=8 eval_every=40 eval_batches=4 warmup_steps=16 max_lr=0.003000 min_lr=0.000300 weight_decay=0.1 grad_clip=1.0
 step=001 lr=0.000188 train_loss=2.1244 grad_norm=3.598
@@ -209,11 +209,11 @@ eval step=120 loss=0.0493
 sample step=120 ids=[1, 2, 3, 4, 1, 5, 1, 2, 3, 4, 1, 5, 1, 2, 3, 4]
 eval step=160 loss=0.0467
 sample step=160 ids=[1, 2, 3, 4, 1, 5, 1, 2, 3, 4, 1, 5, 1, 2, 3, 4]
-summary: first_train_loss=2.1244 final_train_loss=0.0494 best_eval_loss=0.0467 eval_points=4 elapsed_s=1.657
+summary: first_train_loss=2.1244 final_train_loss=0.0494 best_eval_loss=0.0467 eval_points=4 elapsed_s=1.200
 log: outputs/losses.jsonl records=160
 ```
 
-The process took 4.012 s wall time including Python and torch startup; `elapsed_s=1.657` measures only the training loop. The model learns the six-token phrase: the final 16-token greedy sample is `1,2,3,4,1,5` repeated, including all 12 generated tokens. This is evidence that the loop optimizes and that the probe is wired to the trained model, not evidence of language ability.
+The process took 3.386 s wall time including Python and torch startup; `elapsed_s=1.200` measures only the training loop. The model learns the six-token phrase: the final 16-token greedy sample is `1,2,3,4,1,5` repeated, including all 12 generated tokens. This is evidence that the loop optimizes and that the probe is wired to the trained model, not evidence of language ability.
 
 ### JSONL artifact
 
