@@ -139,8 +139,11 @@ There is no real-provider mode in this lesson: it trains from scratch. To use re
 The model and batches are ordinary PyTorch tensors, so a GPU path is mechanical:
 
 ```python
+import sys
+
 import torch
 
+sys.path.insert(0, "code")
 from main import (
     GPTConfig, GPTModel, TrainConfig, make_batches,
     make_synthetic_corpus, train,
