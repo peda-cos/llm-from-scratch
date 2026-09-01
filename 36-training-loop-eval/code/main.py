@@ -608,7 +608,7 @@ def make_batches(
             f"context_length={context_value}"
         )
 
-    windows = (token_ids.numel() - context_value) // context_value
+    windows = (token_ids.numel() - 1) // context_value
     batches: list[tuple[Tensor, Tensor]] = []
     for start_window in range(0, windows - batch_value + 1, batch_value):
         inputs = torch.stack(

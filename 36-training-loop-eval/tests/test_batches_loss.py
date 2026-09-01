@@ -27,7 +27,7 @@ def test_make_batches_is_deterministic_and_drops_partial_tail() -> None:
     tokens = torch.arange(45, dtype=torch.long)
     batch_size, context_length = 3, 4
     batches = make_batches(tokens, batch_size, context_length)
-    expected = ((45 - context_length) // context_length) // batch_size
+    expected = ((45 - 1) // context_length) // batch_size
 
     assert len(batches) == expected == 3
     for inputs, targets in batches:
@@ -39,6 +39,15 @@ def test_make_batches_is_deterministic_and_drops_partial_tail() -> None:
         torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
         for a, b in zip(batches, again, strict=True)
     )
+
+
+def test_make_batches_uses_minimum_window_at_boundary() -> None:
+    tokens = torch.arange(9, dtype=torch.long)
+    batches = make_batches(tokens, batch_size=2, context_length=4)
+    assert len(batches) == 1
+    inputs, targets = batches[0]
+    assert inputs.tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert targets.tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
 
 
 def test_make_batches_rejects_invalid_inputs() -> None:
