@@ -111,7 +111,9 @@ Known real-checkpoint entries are handled explicitly:
 - `lm_head.weight` is ignored because GPT-2 ties it to `wte`; loading `wte` updates the head. A checkpoint that includes the alias does not produce a spurious "unexpected" report.
 - Bias-less and untied configurations are rejected with `ValueError`: the fixed GPT-2 map includes biases, and published GPT-2 files do not contain a separate head.
 
-The loader is strict by design. A checkpoint for 12 layers loaded into a 2-layer model reports extra block tensors as unexpected and the missing local blocks as missing; neither half-load is possible.
+The loader is strict by design. A checkpoint for 12 layers loaded into a 2-layer model reports the extra block tensors as unexpected; a 2-layer checkpoint loaded into a 12-layer model reports the absent blocks as missing. Neither half-load is possible.
+
+The `safetensors` torch writer converts through NumPy internally, so NumPy is pinned alongside torch and safetensors even though the loader itself only returns torch tensors.
 
 ## Name map
 
