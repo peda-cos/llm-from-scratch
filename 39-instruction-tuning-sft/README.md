@@ -229,6 +229,73 @@ The model, batches, and labels are device-agnostic PyTorch tensors, so a GPU
 port would move them with `.to(device)` and update the training/eval loops. That
 port is not implemented or measured here, and no GPU numbers are claimed.
 
+## Measured results
+
+Measured locally on CPU with the pinned environment; one seeded default run,
+not a benchmark. The default demo took 25.3 s wall time (the `verify.sh` gate,
+including the 20-test suite and mypy, took 40.7 s):
+
+```text
+instruction-tuning-sft: seed=0 train=160 test=40 max_len=64
+dataset: pairs=200 capitals=40 arithmetic=30 lists=30 summaries=30 code=30 definitions=40
+tokenizer: vocab=259 inst=256 resp=257 pad=258 terminator=10
+model: parameters=253152 context_length=64 hidden=96 heads=4 layers=2
+mask: targets=6683 response=2576 ignored=4107 response_fraction=0.385
+baseline: exact_match=0.000 correct=0/40
+epoch   5: loss=1.7143 exact_match=0.025
+epoch  10: loss=0.5903 exact_match=0.125
+epoch  15: loss=0.2526 exact_match=0.300
+epoch  20: loss=0.0935 exact_match=0.425
+epoch  25: loss=0.1030 exact_match=0.350
+epoch  30: loss=0.0361 exact_match=0.575
+epoch  35: loss=0.0365 exact_match=0.575
+epoch  40: loss=0.0123 exact_match=0.700
+epoch  45: loss=0.0390 exact_match=0.475
+epoch  50: loss=0.0599 exact_match=0.475
+epoch  55: loss=0.0418 exact_match=0.650
+epoch  60: loss=0.0086 exact_match=0.775
+final: exact_match=0.775 correct=31/40
+per-category: arithmetic=1.000 (6/6)
+per-category: capitals=1.000 (8/8)
+per-category: code=0.333 (2/6)
+per-category: definitions=0.625 (5/8)
+per-category: lists=1.000 (6/6)
+per-category: summaries=0.667 (4/6)
+sample: [MATCH] instruction=What city is Spain's capital?
+sample:         gold=Madrid.
+sample:         prediction=Madrid.
+sample: [MATCH] instruction=Where is the capital of France?
+sample:         gold=Paris.
+sample:         prediction=Paris.
+sample: [MATCH] instruction=Name the capital city of Italy.
+sample:         gold=Rome.
+sample:         prediction=Rome.
+check: loss_finite=true mask_only_response=true
+```
+
+The untrained baseline is 0/40. After training, 31/40 held-out paraphrases
+produce the gold response character for character. The lookup tasks (capitals,
+arithmetic, lists) reach 1.0; the copying/definition tasks remain weaker, which
+is the interesting failure mode: a 253k-parameter model trained from random
+initialization learns the format and many answers, but exact-match is strict
+about every byte. The eval curve oscillates because each point measures only 40
+examples and training is not early-stopped.
+
+The mask line shows the objective directly: only 2,576 of 6,683 positions
+(38.5%) are response targets. The other 4,107 instruction and boundary
+positions, plus every right-padding position added by `sft_collate`,
+contribute no loss and no gradient.
+
+Verification on the same machine:
+
+```text
+20 passed, 1 warning in 7.79s
+Success: no issues found in 2 source files
+verify: ok
+```
+
+The warning is PyTorch's optional-NumPy notice described above.
+
 ## Design decisions
 
 - **Response-only loss.** The labels are built before padding and the loss
