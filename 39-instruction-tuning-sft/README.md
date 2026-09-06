@@ -14,12 +14,12 @@ every example is serialized as
 and a tiny transformer is trained to predict response bytes conditioned on the
 instruction. The cross-entropy loss is masked so instruction tokens, the
 `[RESP]` boundary, and padding contribute nothing (`ignore_index=-100`); only
-response bytes and the terminating newline produce gradients.
+response bytes and the terminating newline are scored.
 
 The module is self-contained, CPU-only, deterministic, and independent of the
 other track modules. It trains a 253,152-parameter transformer from random
-initialization on 200 generated instruction-response pairs, evaluates held-out
-exact-match, and prints per-category results.
+initialization on a 200-pair generated fixture (160 train, 40 held out),
+evaluates held-out exact-match, and prints per-category results.
 
 ## Architecture
 
@@ -185,7 +185,8 @@ uv run --frozen python code/main.py
 
 The first command installs the pinned CPU environment into `.venv/`. The demo
 builds the fixture, trains, evaluates, and prints the measurements; it writes
-nothing to disk.
+no fixtures, checkpoints, or result files. Python may create the usual ignored
+`__pycache__/` bytecode.
 
 A fast smoke run (tiny model, two epochs):
 
@@ -283,8 +284,10 @@ examples and training is not early-stopped.
 
 The mask line shows the objective directly: only 2,576 of 6,683 positions
 (38.5%) are response targets. The other 4,107 instruction and boundary
-positions, plus every right-padding position added by `sft_collate`,
-contribute no loss and no gradient.
+positions, plus every right-padding position added by `sft_collate`, are
+excluded from the loss numerator and denominator. Their logits receive no
+direct target gradient; response loss still flows back through attention into
+the instruction representations, which is what conditions the answer.
 
 Verification on the same machine:
 
@@ -299,10 +302,13 @@ The warning is PyTorch's optional-NumPy notice described above.
 ## Design decisions
 
 - **Response-only loss.** The labels are built before padding and the loss
-  applies the one-token shift explicitly. A unit test proves the masked
-  positions receive zero gradient.
+  applies the one-token shift explicitly. A unit test proves the masked target
+  logits receive zero direct gradient.
 - **Tied LM head.** Tying reduces parameters and is standard for small
-  decoder-only models. The PAD embedding row is zeroed and never trained.
+  decoder-only models. The PAD embedding row is zeroed at initialization;
+  because the head is tied, that row can still receive gradient as a negative
+  output class, but PAD labels are masked and padding never affects real-token
+  logits.
 - **No key-padding mask.** Right padding with a causal mask is sufficient for
   this training layout; tests pin that trailing pads do not change earlier
   logits.
@@ -353,8 +359,8 @@ The warning is PyTorch's optional-NumPy notice described above.
 - dataset masking of instruction/boundary and preservation of response/newline
   labels;
 - dynamic padding, pad-label masking, and malformed batch rejection;
-- the explicit label shift, manual cross-entropy equivalence, and zero gradient
-  on ignored positions;
+- the explicit label shift, manual cross-entropy equivalence, and zero direct
+  gradient on ignored target positions;
 - model shapes, tied head, parameter count, causal invariance, and validation;
 - greedy/sampled generation, all stop rules, context limits, and mode restore;
 - exact-match normalization, per-category evaluation, and mode restore;
