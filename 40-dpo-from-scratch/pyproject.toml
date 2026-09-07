@@ -1,0 +1,34 @@
+[project]
+name = "dpo-from-scratch"
+version = "0.1.0"
+description = "Direct Preference Optimization from scratch on a tiny byte-level transformer."
+requires-python = ">=3.11"
+authors = [{ name = "Pedro Monteiro" }]
+dependencies = ["torch==2.15.0"]
+
+[dependency-groups]
+dev = [
+  "pytest==9.2.0",
+  "mypy==2.4.1",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["code"]
+addopts = "-q"
+
+[tool.mypy]
+strict = true
+files = ["code/main.py", "tests"]
+mypy_path = "code"
