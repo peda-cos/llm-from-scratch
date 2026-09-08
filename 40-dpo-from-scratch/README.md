@@ -409,9 +409,11 @@ The warning is PyTorch's optional-NumPy notice.
   rate, or beta sweep. The measured margin is a training diagnostic, not a
   human-preference benchmark.
 - The stretch goals are intentionally skipped: length normalization, IPO,
-  label smoothing, and a smaller distilled reference. The README cites IPO and
-  length-bias sources because they explain the limitations, not because those
-  variants are implemented.
+  label smoothing, and a smaller distilled reference. IPO replaces the
+  sigmoid-plus-log loss with `(z - 1)^2` to avoid over-confident fitting on
+  near-deterministic preferences; it is not implemented here. The README cites
+  IPO and length-bias sources because they explain the limitations, not because
+  those variants are implemented.
 - No GPU path or real-provider adapter is measured. The tensor code is
   device-aware where practical, but only CPU numbers are reported.
 - The module has no NumPy dependency; PyTorch's optional-NumPy warning is
