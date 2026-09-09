@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import math
 from collections import Counter
+from collections.abc import Sequence
 
 import pytest
 import torch
+from torch import Tensor
 
 from main import (
     BYTE_VOCAB_SIZE,
@@ -13,13 +17,22 @@ from main import (
     PAD_ID,
     RESP_ID,
     VOCAB_SIZE,
+    Aggregator,
+    EvalDatasets,
+    EvalResult,
+    EvalSuite,
+    HistogramBin,
     InstructionTokenizer,
     JudgeVerdict,
     ModelConfig,
+    PerplexityExampleResult,
     QaExample,
+    TextExampleResult,
     TinyGPT,
     count_parameters,
     exact_match,
+    exact_match_eval,
+    judge_eval,
     make_em_fixture,
     make_f1_fixture,
     make_judge_fixture,
@@ -28,7 +41,9 @@ from main import (
     make_training_pairs,
     mock_judge,
     normalise_text,
+    perplexity_eval,
     token_f1,
+    token_f1_eval,
 )
 
 
@@ -253,3 +268,298 @@ def test_mock_judge_covers_every_band() -> None:
         JudgeVerdict(6, "bad")
     with pytest.raises(ValueError):
         JudgeVerdict(3, "")
+
+
+class ScriptedPredictor:
+    def __init__(self, predictions: Sequence[str]) -> None:
+        self._predictions = tuple(predictions)
+        self._index = 0
+
+    def predict(self, instruction: str) -> str:
+        if not instruction:
+            raise AssertionError("instruction must not be empty")
+        if self._index >= len(self._predictions):
+            raise AssertionError("predictor received too many requests")
+        value = self._predictions[self._index]
+        self._index += 1
+        return value
+
+
+class ZeroLogitsModel(torch.nn.Module):
+    def forward(self, token_ids: Tensor) -> Tensor:
+        batch, length = token_ids.shape
+        return torch.zeros((batch, length, VOCAB_SIZE))
+
+
+class NextTokenCopyModel(torch.nn.Module):
+    def forward(self, token_ids: Tensor) -> Tensor:
+        batch, length = token_ids.shape
+        logits = torch.zeros((batch, length, VOCAB_SIZE))
+        for row in range(batch):
+            for position in range(length - 1):
+                target = int(token_ids[row, position + 1].item())
+                logits[row, position, target] = 20.0
+        return logits
+
+
+def _examples() -> tuple[QaExample, ...]:
+    return (
+        QaExample("capital?", "Paris", "test"),
+        QaExample("capital again?", "Paris", "test"),
+        QaExample("capital last?", "Rome", "test"),
+    )
+
+
+def test_exact_match_eval_aggregates_predictions() -> None:
+    predictor = ScriptedPredictor([" paris. ", "Lyon", "rome"])
+    result = exact_match_eval(predictor, _examples())
+    assert result.name == "exact_match"
+    assert result.metric == "accuracy"
+    assert result.value == pytest.approx(2 / 3)
+    assert len(result.examples) == 3
+    first, second, third = result.examples
+    assert isinstance(first, TextExampleResult)
+    assert isinstance(second, TextExampleResult)
+    assert isinstance(third, TextExampleResult)
+    assert first.score == 1.0
+    assert second.score == 0.0
+    assert third.normalised_prediction == "rome"
+
+
+def test_token_f1_eval_aggregates_predictions() -> None:
+    predictor = ScriptedPredictor(["red blue green", "x"])
+    examples = (
+        QaExample("colors?", "red green yellow", "test"),
+        QaExample("other?", "a b", "test"),
+    )
+    result = token_f1_eval(predictor, examples)
+    assert result.name == "token_f1"
+    assert result.metric == "mean_token_f1"
+    assert result.value == pytest.approx(1 / 3)
+    scores = [
+        example.score
+        for example in result.examples
+        if isinstance(example, TextExampleResult)
+    ]
+    assert scores == pytest.approx([2 / 3, 0.0])
+
+
+def test_judge_eval_aggregates_scores_and_rationales() -> None:
+    predictor = ScriptedPredictor(["Paris", "a b c", "x"])
+    examples = (
+        QaExample("q1", "paris", "test"),
+        QaExample("q2", "a b", "test"),
+        QaExample("q3", "a b", "test"),
+    )
+    result = judge_eval(predictor, examples)
+    assert result.name == "judge"
+    assert result.metric == "mean_judge_score"
+    assert result.value == pytest.approx((5 + 4 + 1) / 3)
+    text_examples = [
+        example
+        for example in result.examples
+        if isinstance(example, TextExampleResult)
+    ]
+    assert [example.score for example in text_examples] == [5.0, 4.0, 1.0]
+    assert all(example.rationale for example in text_examples)
+
+
+def test_perplexity_uniform_model_counts_only_real_targets() -> None:
+    tokenizer = InstructionTokenizer()
+    model = ZeroLogitsModel()
+    result = perplexity_eval(model, tokenizer, ("ab", "hello"))
+    assert result.value == pytest.approx(float(VOCAB_SIZE))
+    perplexity_examples = [
+        example
+        for example in result.examples
+        if isinstance(example, PerplexityExampleResult)
+    ]
+    assert [example.tokens for example in perplexity_examples] == [1, 4]
+    assert sum(bin.count for bin in result.histogram) == 5
+    assert all(bin.count >= 0 for bin in result.histogram)
+
+
+def test_perplexity_uses_next_token_alignment() -> None:
+    tokenizer = InstructionTokenizer()
+    model = NextTokenCopyModel()
+    model.train()
+    result = perplexity_eval(model, tokenizer, ("abc", "hello"))
+    assert result.value == pytest.approx(1.0, abs=1e-5)
+    assert model.training is True
+    assert sum(bin.count for bin in result.histogram) == 6
+
+
+def test_perplexity_rejects_invalid_documents() -> None:
+    tokenizer = InstructionTokenizer(max_len=8)
+    model = ZeroLogitsModel()
+    with pytest.raises(ValueError):
+        perplexity_eval(model, tokenizer, ())
+    with pytest.raises(ValueError):
+        perplexity_eval(model, tokenizer, ("a",))
+    with pytest.raises(ValueError):
+        perplexity_eval(model, tokenizer, ("x" * 9,))
+
+
+def test_eval_suite_runs_all_evals_in_spec_order() -> None:
+    tokenizer = InstructionTokenizer()
+    datasets = EvalDatasets(
+        lm_corpus=make_lm_fixture(),
+        em=make_em_fixture(),
+        f1=make_f1_fixture(),
+        judge=make_judge_fixture(),
+    )
+    model = TinyGPT(ModelConfig(hidden=16, num_heads=2, num_layers=1), seed=0)
+    suite = EvalSuite(
+        model,
+        tokenizer,
+        datasets,
+        max_new_tokens=1,
+        enabled=("judge", "perplexity", "exact_match", "token_f1"),
+    )
+    results = suite.run()
+    assert [result.name for result in results] == [
+        "perplexity",
+        "exact_match",
+        "token_f1",
+        "judge",
+    ]
+    assert all(len(result.examples) == 20 for result in results)
+
+    subset = EvalSuite(
+        model,
+        tokenizer,
+        datasets,
+        max_new_tokens=1,
+        enabled=("exact_match", "token_f1"),
+    )
+    assert [result.name for result in subset.run()] == [
+        "exact_match",
+        "token_f1",
+    ]
+    with pytest.raises(ValueError):
+        EvalSuite(
+            model,
+            tokenizer,
+            datasets,
+            max_new_tokens=1,
+            enabled=("bogus",),
+        )
+
+
+def _text_result(score: float) -> TextExampleResult:
+    return TextExampleResult(
+        instruction="q",
+        reference="r",
+        prediction="p",
+        score=score,
+        normalised_prediction="p",
+        normalised_reference="r",
+        rationale="test",
+    )
+
+
+def _result(name: str, value: float) -> EvalResult:
+    if name == "perplexity":
+        example = PerplexityExampleResult(
+            document="ab",
+            tokens=1,
+            mean_nll=math.log(value),
+            perplexity=value,
+        )
+        return EvalResult(
+            name=name,
+            metric="perplexity",
+            value=value,
+            examples=(example,),
+            histogram=(HistogramBin("[0,0.5)", 1),),
+        )
+    metric = {
+        "exact_match": "accuracy",
+        "token_f1": "mean_token_f1",
+        "judge": "mean_judge_score",
+    }[name]
+    return EvalResult(
+        name=name,
+        metric=metric,
+        value=value,
+        examples=(_text_result(value),),
+    )
+
+
+def test_aggregator_normalisation_contract() -> None:
+    assert Aggregator.normalise("perplexity", 1.0) == 1.0
+    assert Aggregator.normalise("perplexity", math.e) == pytest.approx(0.5)
+    assert Aggregator.normalise("exact_match", 0.25) == 0.25
+    assert Aggregator.normalise("token_f1", 1.0) == 1.0
+    assert Aggregator.normalise("judge", 5.0) == 1.0
+    for name, value in (
+        ("perplexity", 0.5),
+        ("exact_match", 1.1),
+        ("token_f1", -0.1),
+        ("judge", 0.0),
+        ("judge", 6.0),
+        ("bogus", 1.0),
+    ):
+        with pytest.raises(ValueError):
+            Aggregator.normalise(name, value)
+
+
+def test_aggregator_weighted_mean_and_contributions() -> None:
+    aggregator = Aggregator({"exact_match": 1.0, "token_f1": 3.0})
+    results = (_result("exact_match", 0.5), _result("token_f1", 1.0))
+    report = aggregator.aggregate(results)
+    assert report.aggregate == pytest.approx(0.875)
+    assert [scored.contribution for scored in report.evals] == pytest.approx(
+        [0.125, 0.75]
+    )
+    assert sum(scored.contribution for scored in report.evals) == pytest.approx(
+        report.aggregate
+    )
+    assert report.weights == {"exact_match": 1.0, "token_f1": 3.0}
+
+
+def test_aggregator_rejects_invalid_configuration_and_results() -> None:
+    with pytest.raises(ValueError):
+        Aggregator({"bogus": 1.0})
+    with pytest.raises(ValueError):
+        Aggregator({"exact_match": -1.0})
+    with pytest.raises(ValueError):
+        Aggregator({"exact_match": float("nan")})
+    with pytest.raises(ValueError):
+        Aggregator({})
+    with pytest.raises(ValueError):
+        Aggregator({"exact_match": 0.0})
+    with pytest.raises(ValueError):
+        Aggregator().aggregate([])
+    duplicate = (_result("exact_match", 1.0), _result("exact_match", 1.0))
+    with pytest.raises(ValueError):
+        Aggregator({"exact_match": 1.0}).aggregate(duplicate)
+    with pytest.raises(ValueError):
+        Aggregator({"exact_match": 1.0}).aggregate(
+            (_result("exact_match", 1.0), _result("token_f1", 1.0))
+        )
+
+
+def test_report_json_has_stable_keys_and_recomputable_aggregate() -> None:
+    results = (
+        _result("perplexity", math.e),
+        _result("exact_match", 0.5),
+        _result("token_f1", 1.0),
+        _result("judge", 2.5),
+    )
+    report = Aggregator().aggregate(results, metadata={"seed": 0})
+    assert report.aggregate == pytest.approx(0.65)
+    payload = report.to_json_dict()
+    assert payload["schema_version"] == 1
+    assert payload["aggregate"] == pytest.approx(0.65)
+    evals = payload["evals"]
+    assert isinstance(evals, dict)
+    assert set(evals) == {"perplexity", "exact_match", "token_f1", "judge"}
+    perplexity_payload = evals["perplexity"]
+    assert isinstance(perplexity_payload, dict)
+    assert perplexity_payload["scored_tokens"] == 1
+    assert perplexity_payload["num_examples"] == 1
+    parsed = json.loads(report.to_json())
+    assert parsed["schema_version"] == 1
+    assert parsed["metadata"] == {"seed": 0}
+    assert parsed["aggregate"] == pytest.approx(0.65)

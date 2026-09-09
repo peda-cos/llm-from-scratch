@@ -10,10 +10,12 @@ download, or a provider API.
 
 from __future__ import annotations
 
+import json
 import math
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -792,3 +794,622 @@ def mock_judge(
     if score >= 0.2:
         return JudgeVerdict(2, f"token F1 {score:.3f} in [0.20, 0.50)")
     return JudgeVerdict(1, f"token F1 {score:.3f} < 0.20")
+
+
+# ---------------------------------------------------------------------------
+# Evaluation results, predictors, and the four evals
+# ---------------------------------------------------------------------------
+
+JsonValue: TypeAlias = (
+    "str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]"
+)
+
+
+@dataclass(frozen=True)
+class TextExampleResult:
+    instruction: str
+    reference: str
+    prediction: str
+    score: float
+    normalised_prediction: str
+    normalised_reference: str
+    rationale: str
+    kind: str = "text"
+
+
+@dataclass(frozen=True)
+class PerplexityExampleResult:
+    document: str
+    tokens: int
+    mean_nll: float
+    perplexity: float
+    kind: str = "perplexity"
+
+
+EvalExample: TypeAlias = "TextExampleResult | PerplexityExampleResult"
+
+
+@dataclass(frozen=True)
+class HistogramBin:
+    label: str
+    count: int
+
+    def __post_init__(self) -> None:
+        _require_text("label", self.label)
+        _require_int("count", self.count, minimum=0)
+
+
+@dataclass(frozen=True)
+class EvalResult:
+    name: str
+    metric: str
+    value: float
+    examples: tuple[EvalExample, ...]
+    histogram: tuple[HistogramBin, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.name not in EVAL_NAMES:
+            raise ValueError(f"unknown eval name {self.name!r}")
+        _require_text("metric", self.metric)
+        value = _require_float("value", self.value, minimum=0.0)
+        if not math.isfinite(value):
+            raise ValueError("value must be finite")
+        if not self.examples:
+            raise ValueError("examples must not be empty")
+        if self.name == "perplexity" and self.value <= 0.0:
+            raise ValueError("perplexity must be > 0")
+
+
+class Predictor(Protocol):
+    def predict(self, instruction: str) -> str: ...
+
+
+JudgeFn: TypeAlias = "Callable[[str, str, str], JudgeVerdict]"
+LossBins: tuple[tuple[str, float], ...] = (
+    ("[0,0.5)", 0.5),
+    ("[0.5,1)", 1.0),
+    ("[1,2)", 2.0),
+    ("[2,4)", 4.0),
+    ("[4,8)", 8.0),
+    ("[8,inf)", math.inf),
+)
+
+
+def _validate_examples(
+    examples: Sequence[QaExample], name: str
+) -> tuple[QaExample, ...]:
+    if isinstance(examples, (str, bytes)) or not isinstance(examples, Sequence):
+        raise TypeError(f"{name} examples must be a sequence")
+    values = tuple(examples)
+    if not values:
+        raise ValueError(f"{name} examples must not be empty")
+    if not all(isinstance(example, QaExample) for example in values):
+        raise TypeError(f"{name} examples must contain QaExample values")
+    return values
+
+
+def _loss_bin(value: float) -> str:
+    for label, upper in LossBins:
+        if value < upper:
+            return label
+    return LossBins[-1][0]
+
+
+def _predict_text(predictor: Predictor, instruction: str) -> str:
+    prediction = predictor.predict(instruction)
+    if not isinstance(prediction, str):
+        raise TypeError("predictor must return a string")
+    return prediction
+
+
+def perplexity_eval(
+    model: nn.Module,
+    tokenizer: InstructionTokenizer,
+    corpus: Sequence[str],
+) -> EvalResult:
+    """Compute document-level held-out perplexity with pad masking."""
+    if not isinstance(tokenizer, InstructionTokenizer):
+        raise TypeError("tokenizer must be an InstructionTokenizer")
+    if isinstance(corpus, (str, bytes)) or not isinstance(corpus, Sequence):
+        raise TypeError("corpus must be a sequence of strings")
+    documents = tuple(corpus)
+    if not documents:
+        raise ValueError("corpus must not be empty")
+
+    encoded: list[list[int]] = []
+    for document in documents:
+        text = _require_text("document", document)
+        ids = list(text.encode("utf-8"))
+        if len(ids) < 2:
+            raise ValueError("each document must contain at least two bytes")
+        if len(ids) > tokenizer.max_len:
+            raise ValueError(
+                f"document length {len(ids)} exceeds max_len {tokenizer.max_len}"
+            )
+        encoded.append(ids)
+
+    max_length = max(len(ids) for ids in encoded)
+    input_ids = torch.full(
+        (len(encoded), max_length),
+        PAD_ID,
+        dtype=torch.long,
+    )
+    for row, ids in enumerate(encoded):
+        input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            logits = model(input_ids)
+            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
+            targets = input_ids[:, 1:]
+            mask = targets != PAD_ID
+            token_nll = -log_probs.gather(
+                2, targets.unsqueeze(-1)
+            ).squeeze(-1)
+            nll_values = token_nll[mask]
+    finally:
+        model.train(was_training)
+
+    token_count = int(mask.sum().item())
+    if token_count == 0:
+        raise ValueError("no scoreable tokens in the corpus")
+    total_nll = float(nll_values.sum().item())
+    if not math.isfinite(total_nll):
+        raise ValueError("model produced non-finite negative log-likelihood")
+    perplexity = math.exp(total_nll / token_count)
+    if not math.isfinite(perplexity) or perplexity <= 0.0:
+        raise ValueError("computed perplexity is not finite and positive")
+
+    examples: list[PerplexityExampleResult] = []
+    for row, (document, ids) in enumerate(zip(documents, encoded)):
+        row_mask = mask[row]
+        row_count = int(row_mask.sum().item())
+        if row_count != len(ids) - 1:
+            raise ValueError("internal mask accounting mismatch")
+        row_nll = float(token_nll[row][row_mask].sum().item())
+        mean_nll = row_nll / row_count
+        examples.append(
+            PerplexityExampleResult(
+                document=document,
+                tokens=row_count,
+                mean_nll=mean_nll,
+                perplexity=math.exp(mean_nll),
+            )
+        )
+
+    counts = Counter(_loss_bin(float(value)) for value in nll_values.tolist())
+    histogram = tuple(
+        HistogramBin(label=label, count=counts[label])
+        for label, _ in LossBins
+    )
+    return EvalResult(
+        name="perplexity",
+        metric="perplexity",
+        value=perplexity,
+        examples=tuple(examples),
+        histogram=histogram,
+    )
+
+
+def exact_match_eval(
+    predictor: Predictor, examples: Sequence[QaExample]
+) -> EvalResult:
+    """Mean exact match after answer normalisation."""
+    values = _validate_examples(examples, "exact match")
+    records: list[TextExampleResult] = []
+    total = 0.0
+    for example in values:
+        prediction = _predict_text(predictor, example.instruction)
+        matched = exact_match(prediction, example.reference)
+        score = 1.0 if matched else 0.0
+        total += score
+        records.append(
+            TextExampleResult(
+                instruction=example.instruction,
+                reference=example.reference,
+                prediction=prediction,
+                score=score,
+                normalised_prediction=normalise_text(prediction),
+                normalised_reference=normalise_text(example.reference),
+                rationale="match" if matched else "mismatch",
+            )
+        )
+    return EvalResult(
+        name="exact_match",
+        metric="accuracy",
+        value=total / len(values),
+        examples=tuple(records),
+    )
+
+
+def token_f1_eval(
+    predictor: Predictor, examples: Sequence[QaExample]
+) -> EvalResult:
+    """Mean token-level F1 across open-form answers."""
+    values = _validate_examples(examples, "token F1")
+    records: list[TextExampleResult] = []
+    total = 0.0
+    for example in values:
+        prediction = _predict_text(predictor, example.instruction)
+        score = token_f1(prediction, example.reference)
+        total += score
+        records.append(
+            TextExampleResult(
+                instruction=example.instruction,
+                reference=example.reference,
+                prediction=prediction,
+                score=score,
+                normalised_prediction=normalise_text(prediction),
+                normalised_reference=normalise_text(example.reference),
+                rationale=f"token F1 {score:.3f}",
+            )
+        )
+    return EvalResult(
+        name="token_f1",
+        metric="mean_token_f1",
+        value=total / len(values),
+        examples=tuple(records),
+    )
+
+
+def judge_eval(
+    predictor: Predictor,
+    examples: Sequence[QaExample],
+    *,
+    judge: JudgeFn = mock_judge,
+) -> EvalResult:
+    """Mean 1-5 judge score across model predictions."""
+    values = _validate_examples(examples, "judge")
+    if not callable(judge):
+        raise TypeError("judge must be callable")
+    records: list[TextExampleResult] = []
+    total = 0.0
+    for example in values:
+        prediction = _predict_text(predictor, example.instruction)
+        verdict = judge(
+            example.instruction, prediction, example.reference
+        )
+        if not isinstance(verdict, JudgeVerdict):
+            raise TypeError("judge must return a JudgeVerdict")
+        total += verdict.score
+        records.append(
+            TextExampleResult(
+                instruction=example.instruction,
+                reference=example.reference,
+                prediction=prediction,
+                score=float(verdict.score),
+                normalised_prediction=normalise_text(prediction),
+                normalised_reference=normalise_text(example.reference),
+                rationale=verdict.rationale,
+            )
+        )
+    return EvalResult(
+        name="judge",
+        metric="mean_judge_score",
+        value=total / len(values),
+        examples=tuple(records),
+    )
+
+
+def generate_greedy(
+    model: nn.Module,
+    tokenizer: InstructionTokenizer,
+    instruction: str,
+    max_new_tokens: int,
+) -> str:
+    """Generate a greedy answer until a newline or a non-byte special."""
+    if not isinstance(tokenizer, InstructionTokenizer):
+        raise TypeError("tokenizer must be an InstructionTokenizer")
+    limit = _require_int("max_new_tokens", max_new_tokens, minimum=1)
+    prefix = tokenizer.encode_prefix(instruction)
+    if len(prefix) + limit > tokenizer.max_len:
+        raise ValueError(
+            f"prefix length {len(prefix)} plus max_new_tokens {limit} exceeds "
+            f"max_len {tokenizer.max_len}"
+        )
+
+    ids = list(prefix)
+    was_training = model.training
+    model.eval()
+    generated: list[int] = []
+    try:
+        with torch.no_grad():
+            for _ in range(limit):
+                token_ids = torch.tensor([ids], dtype=torch.long)
+                logits = model(token_ids)
+                next_id = int(torch.argmax(logits[0, -1]).item())
+                if next_id == NEWLINE_ID or next_id == PAD_ID or next_id >= 256:
+                    break
+                generated.append(next_id)
+                ids.append(next_id)
+    finally:
+        model.train(was_training)
+    return tokenizer.decode(generated).strip()
+
+
+@dataclass(frozen=True)
+class TinyGptPredictor:
+    model: nn.Module
+    tokenizer: InstructionTokenizer
+    max_new_tokens: int = 32
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tokenizer, InstructionTokenizer):
+            raise TypeError("tokenizer must be an InstructionTokenizer")
+        _require_int(
+            "max_new_tokens", self.max_new_tokens, minimum=1
+        )
+
+    def predict(self, instruction: str) -> str:
+        return generate_greedy(
+            self.model,
+            self.tokenizer,
+            instruction,
+            self.max_new_tokens,
+        )
+
+
+@dataclass(frozen=True)
+class EvalDatasets:
+    lm_corpus: tuple[str, ...]
+    em: tuple[QaExample, ...]
+    f1: tuple[QaExample, ...]
+    judge: tuple[QaExample, ...]
+
+    def __post_init__(self) -> None:
+        if not self.lm_corpus:
+            raise ValueError("lm_corpus must not be empty")
+        _validate_examples(self.em, "EM")
+        _validate_examples(self.f1, "F1")
+        _validate_examples(self.judge, "judge")
+
+
+class EvalSuite:
+    """Thin orchestrator that runs the selected evals in a stable order."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer: InstructionTokenizer,
+        datasets: EvalDatasets,
+        *,
+        max_new_tokens: int = 32,
+        enabled: Sequence[str] = EVAL_NAMES,
+    ) -> None:
+        if not isinstance(model, nn.Module):
+            raise TypeError("model must be an nn.Module")
+        if not isinstance(tokenizer, InstructionTokenizer):
+            raise TypeError("tokenizer must be an InstructionTokenizer")
+        if not isinstance(datasets, EvalDatasets):
+            raise TypeError("datasets must be an EvalDatasets")
+        _require_int("max_new_tokens", max_new_tokens, minimum=1)
+        names = tuple(enabled)
+        if not names:
+            raise ValueError("enabled must not be empty")
+        if len(set(names)) != len(names):
+            raise ValueError("enabled must not contain duplicates")
+        unknown = [name for name in names if name not in EVAL_NAMES]
+        if unknown:
+            raise ValueError(f"unknown eval names: {unknown}")
+        self.model = model
+        self.tokenizer = tokenizer
+        self.datasets = datasets
+        self.max_new_tokens = max_new_tokens
+        self.enabled = names
+
+    def run(self) -> tuple[EvalResult, ...]:
+        predictor = TinyGptPredictor(
+            self.model, self.tokenizer, self.max_new_tokens
+        )
+        results: list[EvalResult] = []
+        for name in EVAL_NAMES:
+            if name not in self.enabled:
+                continue
+            if name == "perplexity":
+                results.append(
+                    perplexity_eval(
+                        self.model, self.tokenizer, self.datasets.lm_corpus
+                    )
+                )
+            elif name == "exact_match":
+                results.append(
+                    exact_match_eval(predictor, self.datasets.em)
+                )
+            elif name == "token_f1":
+                results.append(token_f1_eval(predictor, self.datasets.f1))
+            else:
+                results.append(judge_eval(predictor, self.datasets.judge))
+        return tuple(results)
+
+
+# ---------------------------------------------------------------------------
+# Weighted aggregation and the JSON report
+# ---------------------------------------------------------------------------
+
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "perplexity": 0.2,
+    "exact_match": 0.3,
+    "token_f1": 0.3,
+    "judge": 0.2,
+}
+
+
+@dataclass(frozen=True)
+class ScoredEval:
+    result: EvalResult
+    normalised: float
+    weight: float
+    contribution: float
+
+
+@dataclass(frozen=True)
+class FinalReport:
+    aggregate: float
+    evals: tuple[ScoredEval, ...]
+    weights: Mapping[str, float]
+    metadata: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        aggregate = _require_float("aggregate", self.aggregate, minimum=0.0)
+        if aggregate > 1.0:
+            raise ValueError("aggregate must be <= 1")
+        if not self.evals:
+            raise ValueError("evals must not be empty")
+        for scored in self.evals:
+            _require_float("normalised", scored.normalised, minimum=0.0)
+            _require_float("weight", scored.weight, minimum=0.0)
+            _require_float("contribution", scored.contribution, minimum=0.0)
+
+    def to_json_dict(self) -> dict[str, JsonValue]:
+        eval_payload: dict[str, JsonValue] = {}
+        for scored in self.evals:
+            result = scored.result
+            examples: list[JsonValue] = [
+                _example_to_json(example) for example in result.examples
+            ]
+            payload: dict[str, JsonValue] = {
+                "metric": result.metric,
+                "value": result.value,
+                "normalised": scored.normalised,
+                "weight": scored.weight,
+                "contribution": scored.contribution,
+                "num_examples": len(result.examples),
+                "examples": examples,
+            }
+            if result.name == "perplexity":
+                payload["scored_tokens"] = sum(
+                    example.tokens
+                    for example in result.examples
+                    if isinstance(example, PerplexityExampleResult)
+                )
+                payload["histogram"] = [
+                    {"bin": bin.label, "count": bin.count}
+                    for bin in result.histogram
+                ]
+            eval_payload[result.name] = payload
+        return {
+            "schema_version": 1,
+            "aggregate": self.aggregate,
+            "weights": {
+                name: weight
+                for name, weight in self.weights.items()
+                if name in EVAL_NAMES
+            },
+            "evals": eval_payload,
+            "metadata": dict(self.metadata),
+        }
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_json_dict(), indent=indent)
+
+
+def _example_to_json(example: EvalExample) -> dict[str, JsonValue]:
+    if isinstance(example, TextExampleResult):
+        return {
+            "kind": example.kind,
+            "instruction": example.instruction,
+            "reference": example.reference,
+            "prediction": example.prediction,
+            "score": example.score,
+            "normalised_prediction": example.normalised_prediction,
+            "normalised_reference": example.normalised_reference,
+            "rationale": example.rationale,
+        }
+    return {
+        "kind": example.kind,
+        "document": example.document,
+        "tokens": example.tokens,
+        "mean_nll": example.mean_nll,
+        "perplexity": example.perplexity,
+    }
+
+
+class Aggregator:
+    """Normalise each eval to [0,1] and combine it with configurable weights."""
+
+    def __init__(self, weights: Mapping[str, float] | None = None) -> None:
+        source = DEFAULT_WEIGHTS if weights is None else weights
+        if not isinstance(source, Mapping):
+            raise TypeError("weights must be a mapping")
+        copied: dict[str, float] = {}
+        for name, value in source.items():
+            if name not in EVAL_NAMES:
+                raise ValueError(f"unknown eval name {name!r}")
+            weight = _require_float(f"weight[{name}]", value, minimum=0.0)
+            copied[name] = weight
+        if not copied:
+            raise ValueError("weights must not be empty")
+        if sum(copied.values()) <= 0.0:
+            raise ValueError("weights must have a positive total")
+        self._weights = copied
+
+    @property
+    def weights(self) -> Mapping[str, float]:
+        return dict(self._weights)
+
+    @staticmethod
+    def normalise(name: str, value: float) -> float:
+        if name not in EVAL_NAMES:
+            raise ValueError(f"unknown eval name {name!r}")
+        number = _require_float("value", value, minimum=0.0)
+        if name == "perplexity":
+            if number < 1.0:
+                raise ValueError("perplexity must be >= 1")
+            return 1.0 / (1.0 + math.log(number))
+        if name == "judge":
+            if number < 1.0 or number > 5.0:
+                raise ValueError("judge score must be in [1, 5]")
+            return number / 5.0
+        if number > 1.0:
+            raise ValueError(f"{name} value must be in [0, 1]")
+        return number
+
+    def aggregate(
+        self,
+        results: Sequence[EvalResult],
+        *,
+        metadata: Mapping[str, JsonValue] | None = None,
+    ) -> FinalReport:
+        if isinstance(results, (str, bytes)) or not isinstance(results, Sequence):
+            raise TypeError("results must be a sequence")
+        values = tuple(results)
+        if not values:
+            raise ValueError("results must not be empty")
+        for result in values:
+            if not isinstance(result, EvalResult):
+                raise TypeError("results must contain EvalResult values")
+        names = [result.name for result in values]
+        if len(set(names)) != len(names):
+            raise ValueError("result names must be unique")
+        if set(names) != set(self._weights):
+            raise ValueError(
+                "result names must match the configured weight names"
+            )
+
+        total_weight = sum(self._weights.values())
+        scored: list[ScoredEval] = []
+        aggregate = 0.0
+        for result in values:
+            normalised = self.normalise(result.name, result.value)
+            weight = self._weights[result.name]
+            contribution = weight * normalised / total_weight
+            aggregate += contribution
+            scored.append(
+                ScoredEval(
+                    result=result,
+                    normalised=normalised,
+                    weight=weight,
+                    contribution=contribution,
+                )
+            )
+        if aggregate < 0.0 or aggregate > 1.0 + 1e-9:
+            raise ValueError("aggregate must be in [0, 1]")
+        metadata_value = {} if metadata is None else dict(metadata)
+        return FinalReport(
+            aggregate=min(aggregate, 1.0),
+            evals=tuple(scored),
+            weights=dict(self._weights),
+            metadata=metadata_value,
+        )
