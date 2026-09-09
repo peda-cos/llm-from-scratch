@@ -10,11 +10,14 @@ download, or a provider API.
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import sys
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, TypeAlias
 
 import torch
@@ -430,6 +433,12 @@ _CAPITAL_TRAIN_TEMPLATES: tuple[str, ...] = (
     "Tell me {country}'s capital.",
 )
 _CAPITAL_EM_TEMPLATE = "The capital of {country} is?"
+_CAPITAL_COVERAGE: tuple[tuple[str, str], ...] = (
+    ("Germany", "Berlin"),
+    ("Portugal", "Lisbon"),
+    ("Greece", "Athens"),
+    ("Norway", "Oslo"),
+)
 
 _ARITHMETIC: tuple[tuple[int, int, str], ...] = (
     (2, 3, "+"),
@@ -446,6 +455,11 @@ _ARITHMETIC_TRAIN_TEMPLATES: tuple[str, ...] = (
     "How much is {a} {op} {b}?",
 )
 _ARITHMETIC_EM_TEMPLATE = "{a} {op} {b} equals?"
+_ARITHMETIC_COVERAGE: tuple[tuple[int, int, str], ...] = (
+    (3, 4, "+"),
+    (6, 2, "*"),
+    (10, 3, "-"),
+)
 
 _LISTS: tuple[tuple[str, str], ...] = (
     ("colors", "red, green, blue."),
@@ -471,6 +485,12 @@ _LIST_TRAIN_TEMPLATES: tuple[str, ...] = (
     "Give three examples of {name}.",
 )
 _LIST_EVAL_TEMPLATE = "Which three {name} come to mind?"
+_LIST_COVERAGE: tuple[tuple[str, str], ...] = (
+    ("berries", "strawberry, blueberry, raspberry."),
+    ("tools", "hammer, saw, drill."),
+    ("sports", "soccer, tennis, swimming."),
+    ("drinks", "water, tea, coffee."),
+)
 
 _DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("variable", "a name bound to a value."),
@@ -495,6 +515,14 @@ _DEFINITION_TRAIN_TEMPLATES: tuple[str, ...] = (
 )
 _F1_DEFINITION_TEMPLATE = "Give a definition of {term}."
 _JUDGE_DEFINITION_TEMPLATE = "In one sentence, define {term}."
+_DEFINITION_COVERAGE: tuple[tuple[str, str], ...] = (
+    ("attention", "a weighting over tokens."),
+    ("epoch", "one pass over the data."),
+    ("batch", "a group of examples."),
+    ("loss", "a training objective."),
+    ("layer", "a stack of operations."),
+    ("weight", "a learned parameter."),
+)
 
 _SUMMARIES: tuple[str, ...] = (
     "cats sleep a lot.",
@@ -515,6 +543,11 @@ _SUMMARY_TRAIN_TEMPLATES: tuple[str, ...] = (
     "Shorten: {text}",
 )
 _SUMMARY_JUDGE_TEMPLATE = "Summary: {text}"
+_SUMMARY_COVERAGE: tuple[str, ...] = (
+    "snow is cold.",
+    "metal is heavy.",
+    "glass is fragile.",
+)
 
 
 def _arithmetic_response(first: int, second: int, operator: str) -> str:
@@ -535,7 +568,7 @@ def _arithmetic_response(first: int, second: int, operator: str) -> str:
 
 def _make_pairs() -> list[QaExample]:
     pairs: list[QaExample] = []
-    for country, city in _CAPITALS:
+    for country, city in (*_CAPITALS, *_CAPITAL_COVERAGE):
         for template in _CAPITAL_TRAIN_TEMPLATES:
             pairs.append(
                 QaExample(
@@ -544,7 +577,15 @@ def _make_pairs() -> list[QaExample]:
                     "capitals",
                 )
             )
-    for first, second, operator in _ARITHMETIC:
+    for country, city in _CAPITAL_COVERAGE:
+        pairs.append(
+            QaExample(
+                _CAPITAL_EM_TEMPLATE.format(country=country),
+                f"{city}.",
+                "capitals",
+            )
+        )
+    for first, second, operator in (*_ARITHMETIC, *_ARITHMETIC_COVERAGE):
         response = _arithmetic_response(first, second, operator)
         for template in _ARITHMETIC_TRAIN_TEMPLATES:
             pairs.append(
@@ -554,7 +595,15 @@ def _make_pairs() -> list[QaExample]:
                     "arithmetic",
                 )
             )
-    for name, items in _LISTS:
+    for first, second, operator in _ARITHMETIC_COVERAGE:
+        pairs.append(
+            QaExample(
+                _ARITHMETIC_EM_TEMPLATE.format(a=first, op=operator, b=second),
+                _arithmetic_response(first, second, operator),
+                "arithmetic",
+            )
+        )
+    for name, items in (*_LISTS, *_LIST_COVERAGE):
         for template in _LIST_TRAIN_TEMPLATES:
             pairs.append(
                 QaExample(
@@ -563,7 +612,15 @@ def _make_pairs() -> list[QaExample]:
                     "lists",
                 )
             )
-    for term, definition in _DEFINITIONS:
+    for name, items in _LIST_COVERAGE:
+        pairs.append(
+            QaExample(
+                _LIST_EVAL_TEMPLATE.format(name=name),
+                items,
+                "lists",
+            )
+        )
+    for term, definition in (*_DEFINITIONS, *_DEFINITION_COVERAGE):
         for template in _DEFINITION_TRAIN_TEMPLATES:
             pairs.append(
                 QaExample(
@@ -572,7 +629,23 @@ def _make_pairs() -> list[QaExample]:
                     "definitions",
                 )
             )
-    for text in _SUMMARIES:
+    for term, definition in _DEFINITION_COVERAGE:
+        pairs.append(
+            QaExample(
+                _F1_DEFINITION_TEMPLATE.format(term=term),
+                definition,
+                "definitions",
+            )
+        )
+    for term, definition in _DEFINITION_COVERAGE[:3]:
+        pairs.append(
+            QaExample(
+                _JUDGE_DEFINITION_TEMPLATE.format(term=term),
+                definition,
+                "definitions",
+            )
+        )
+    for text in (*_SUMMARIES, *_SUMMARY_COVERAGE):
         for template in _SUMMARY_TRAIN_TEMPLATES:
             pairs.append(
                 QaExample(
@@ -581,14 +654,24 @@ def _make_pairs() -> list[QaExample]:
                     "summaries",
                 )
             )
+    for text in _SUMMARY_COVERAGE:
+        pairs.append(
+            QaExample(
+                _SUMMARY_JUDGE_TEMPLATE.format(text=text),
+                text,
+                "summaries",
+            )
+        )
     return pairs
 
 
 def make_training_pairs() -> tuple[QaExample, ...]:
-    """Return the fixed 150-pair training split."""
+    """Return the fixed 233-pair training split."""
     pairs = _make_pairs()
-    if len(pairs) != 150:
-        raise ValueError(f"training fixture must contain 150 pairs, found {len(pairs)}")
+    if len(pairs) != 233:
+        raise ValueError(
+            f"training fixture must contain 233 pairs, found {len(pairs)}"
+        )
     instructions = {pair.instruction for pair in pairs}
     if len(instructions) != len(pairs):
         raise ValueError("training instructions must be unique")
@@ -1413,3 +1496,499 @@ class Aggregator:
             weights=dict(self._weights),
             metadata=metadata_value,
         )
+
+
+# ---------------------------------------------------------------------------
+# Training and the offline demo
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    seed: int = 0
+    lm_steps: int = 80
+    lm_batch_size: int = 8
+    lm_learning_rate: float = 1e-3
+    sft_epochs: int = 60
+    sft_batch_size: int = 8
+    sft_learning_rate: float = 1e-3
+    hidden: int = 96
+    num_heads: int = 4
+    num_layers: int = 2
+    max_new_tokens: int = 32
+
+    def __post_init__(self) -> None:
+        _require_seed(self.seed)
+        _require_int("lm_steps", self.lm_steps, minimum=1)
+        _require_int("lm_batch_size", self.lm_batch_size, minimum=1)
+        _require_float(
+            "lm_learning_rate", self.lm_learning_rate, minimum=0.0
+        )
+        if self.lm_learning_rate == 0.0:
+            raise ValueError("lm_learning_rate must be > 0")
+        _require_int("sft_epochs", self.sft_epochs, minimum=1)
+        _require_int("sft_batch_size", self.sft_batch_size, minimum=1)
+        _require_float(
+            "sft_learning_rate", self.sft_learning_rate, minimum=0.0
+        )
+        if self.sft_learning_rate == 0.0:
+            raise ValueError("sft_learning_rate must be > 0")
+        hidden = _require_int("hidden", self.hidden, minimum=1)
+        heads = _require_int("num_heads", self.num_heads, minimum=1)
+        _require_int("num_layers", self.num_layers, minimum=1)
+        _require_int("max_new_tokens", self.max_new_tokens, minimum=1)
+        if hidden % heads != 0:
+            raise ValueError("hidden must be divisible by num_heads")
+        if self.max_new_tokens >= MAX_SEQUENCE_LENGTH:
+            raise ValueError("max_new_tokens must fit in the context")
+
+
+@dataclass(frozen=True)
+class TrainedModel:
+    model: TinyGPT
+    tokenizer: InstructionTokenizer
+    parameters: int
+    lm_losses: tuple[float, ...]
+    sft_losses: tuple[float, ...]
+    config: TrainConfig
+
+
+def _lm_batches(
+    corpus: Sequence[str],
+    tokenizer: InstructionTokenizer,
+    config: TrainConfig,
+) -> list[tuple[Tensor, Tensor]]:
+    context = min(64, tokenizer.max_len - 1)
+    stream: list[int] = []
+    for document in corpus:
+        text = _require_text("document", document)
+        if "\n" in text or "\r" in text:
+            raise ValueError("LM documents must be single-line")
+        stream.extend(text.encode("utf-8"))
+        stream.append(NEWLINE_ID)
+    if len(stream) <= context:
+        raise ValueError("LM corpus is too short for one training window")
+
+    windows: list[tuple[Tensor, Tensor]] = []
+    for start in range(0, len(stream) - context, context):
+        inputs = torch.tensor(stream[start : start + context], dtype=torch.long)
+        targets = torch.tensor(
+            stream[start + 1 : start + context + 1], dtype=torch.long
+        )
+        windows.append((inputs, targets))
+    batches: list[tuple[Tensor, Tensor]] = []
+    for start in range(0, len(windows), config.lm_batch_size):
+        group = windows[start : start + config.lm_batch_size]
+        batches.append(
+            (
+                torch.stack([item[0] for item in group]),
+                torch.stack([item[1] for item in group]),
+            )
+        )
+    return batches
+
+
+def pretrain_lm(
+    model: TinyGPT,
+    tokenizer: InstructionTokenizer,
+    corpus: Sequence[str],
+    config: TrainConfig,
+    log: Callable[[str], None] | None = None,
+) -> tuple[float, ...]:
+    """Train the model as a causal LM on the held-in synthetic corpus."""
+    batches = _lm_batches(corpus, tokenizer, config)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.lm_learning_rate
+    )
+    losses: list[float] = []
+    model.train()
+    for step in range(1, config.lm_steps + 1):
+        inputs, targets = batches[(step - 1) % len(batches)]
+        logits = model(inputs)
+        loss = F.cross_entropy(
+            logits.reshape(-1, VOCAB_SIZE), targets.reshape(-1)
+        )
+        optimizer.zero_grad(set_to_none=True)
+        torch.autograd.backward(loss)
+        optimizer.step()
+        value = float(loss.item())
+        losses.append(value)
+        if log is not None and (step == 1 or step % 20 == 0):
+            log(f"lm step {step:3d}: loss={value:.4f}")
+    return tuple(losses)
+
+
+def sft_train(
+    model: TinyGPT,
+    tokenizer: InstructionTokenizer,
+    pairs: Sequence[QaExample],
+    config: TrainConfig,
+    log: Callable[[str], None] | None = None,
+) -> tuple[float, ...]:
+    """Fit instruction/answer pairs with completion-only loss."""
+    if isinstance(pairs, (str, bytes)) or not isinstance(pairs, Sequence):
+        raise TypeError("pairs must be a sequence")
+    values = tuple(pairs)
+    if not values:
+        raise ValueError("pairs must not be empty")
+    if not all(isinstance(pair, QaExample) for pair in values):
+        raise TypeError("pairs must contain QaExample values")
+
+    sequences: list[list[int]] = []
+    starts: list[int] = []
+    for pair in values:
+        ids, completion_start = tokenizer.encode_example(
+            pair.instruction, pair.reference
+        )
+        sequences.append(ids)
+        starts.append(completion_start)
+    max_length = max(len(ids) for ids in sequences)
+    input_ids = torch.full(
+        (len(sequences), max_length), PAD_ID, dtype=torch.long
+    )
+    labels = torch.full(
+        (len(sequences), max_length), IGNORE_INDEX, dtype=torch.long
+    )
+    for row, (ids, completion_start) in enumerate(zip(sequences, starts)):
+        input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+        labels[row, completion_start : len(ids)] = torch.tensor(
+            ids[completion_start:], dtype=torch.long
+        )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.sft_learning_rate
+    )
+    losses: list[float] = []
+    model.train()
+    for epoch in range(1, config.sft_epochs + 1):
+        epoch_loss = 0.0
+        batch_count = 0
+        for start in range(0, len(sequences), config.sft_batch_size):
+            batch_inputs = input_ids[start : start + config.sft_batch_size]
+            batch_labels = labels[start : start + config.sft_batch_size]
+            logits = model(batch_inputs)
+            loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, VOCAB_SIZE),
+                batch_labels[:, 1:].reshape(-1),
+                ignore_index=IGNORE_INDEX,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            torch.autograd.backward(loss)
+            optimizer.step()
+            epoch_loss += float(loss.item())
+            batch_count += 1
+        if batch_count == 0:
+            raise ValueError("SFT training produced no batches")
+        average = epoch_loss / batch_count
+        losses.append(average)
+        if log is not None and (epoch == 1 or epoch % 10 == 0):
+            log(f"sft epoch {epoch:3d}: loss={average:.4f}")
+    return tuple(losses)
+
+
+def train_model(config: TrainConfig) -> TrainedModel:
+    if not isinstance(config, TrainConfig):
+        raise TypeError("config must be a TrainConfig")
+    tokenizer = InstructionTokenizer()
+    model = TinyGPT(
+        ModelConfig(
+            hidden=config.hidden,
+            num_heads=config.num_heads,
+            num_layers=config.num_layers,
+        ),
+        seed=config.seed,
+    )
+    lm_losses = pretrain_lm(
+        model,
+        tokenizer,
+        make_lm_training_corpus(),
+        config,
+        log=print,
+    )
+    sft_losses = sft_train(
+        model,
+        tokenizer,
+        make_training_pairs(),
+        config,
+        log=print,
+    )
+    model.eval()
+    return TrainedModel(
+        model=model,
+        tokenizer=tokenizer,
+        parameters=count_parameters(model),
+        lm_losses=lm_losses,
+        sft_losses=sft_losses,
+        config=config,
+    )
+
+
+@dataclass(frozen=True)
+class DemoConfig:
+    seed: int = 0
+    lm_steps: int = 80
+    lm_batch_size: int = 8
+    lm_learning_rate: float = 1e-3
+    sft_epochs: int = 60
+    sft_batch_size: int = 8
+    sft_learning_rate: float = 1e-3
+    hidden: int = 96
+    num_heads: int = 4
+    num_layers: int = 2
+    max_new_tokens: int = 32
+    output_path: Path = Path("outputs/report.json")
+
+    def __post_init__(self) -> None:
+        self.to_train_config()
+        if not isinstance(self.output_path, Path):
+            raise TypeError("output_path must be a Path")
+
+    def to_train_config(self) -> TrainConfig:
+        return TrainConfig(
+            seed=self.seed,
+            lm_steps=self.lm_steps,
+            lm_batch_size=self.lm_batch_size,
+            lm_learning_rate=self.lm_learning_rate,
+            sft_epochs=self.sft_epochs,
+            sft_batch_size=self.sft_batch_size,
+            sft_learning_rate=self.sft_learning_rate,
+            hidden=self.hidden,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            max_new_tokens=self.max_new_tokens,
+        )
+
+
+@dataclass(frozen=True)
+class DemoReport:
+    final: FinalReport
+    results: tuple[EvalResult, ...]
+    training: TrainedModel
+    output_path: Path
+    success: bool
+
+
+def _print_report(report: FinalReport) -> None:
+    print(
+        f"{'eval':<14}{'metric':<18}{'value':>10}{'normalised':>12}"
+        f"{'weight':>9}{'contribution':>14}",
+        flush=True,
+    )
+    for scored in report.evals:
+        result = scored.result
+        print(
+            f"{result.name:<14}{result.metric:<18}{result.value:>10.4f}"
+            f"{scored.normalised:>12.4f}{scored.weight:>9.3f}"
+            f"{scored.contribution:>14.4f}",
+            flush=True,
+        )
+    print(f"aggregate: {report.aggregate:.4f}", flush=True)
+
+
+def _print_diagnostics(results: Sequence[EvalResult]) -> None:
+    for result in results:
+        if result.name == "perplexity":
+            perplexity_examples = [
+                example
+                for example in result.examples
+                if isinstance(example, PerplexityExampleResult)
+            ]
+            if perplexity_examples:
+                worst_document = max(
+                    perplexity_examples,
+                    key=lambda example: example.perplexity,
+                )
+                print(
+                    f"sample: perplexity "
+                    f"worst={worst_document.perplexity:.2f} "
+                    f"tokens={worst_document.tokens} "
+                    f"text={worst_document.document!r}",
+                    flush=True,
+                )
+            continue
+        text_examples = [
+            example
+            for example in result.examples
+            if isinstance(example, TextExampleResult)
+        ]
+        if not text_examples:
+            continue
+        worst_text = min(text_examples, key=lambda example: example.score)
+        print(
+            f"sample: {result.name} score={worst_text.score:.3f} "
+            f"instruction={worst_text.instruction!r} "
+            f"gold={worst_text.reference!r} "
+            f"prediction={worst_text.prediction!r}",
+            flush=True,
+        )
+
+
+def _read_report(path: Path) -> Mapping[str, object]:
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("report JSON must be an object")
+    return parsed
+
+
+def run_demo(config: DemoConfig | None = None) -> DemoReport:
+    """Train, evaluate, print the report table, and write the JSON report."""
+    if config is None:
+        config = DemoConfig()
+    if not isinstance(config, DemoConfig):
+        raise TypeError("config must be a DemoConfig")
+
+    datasets = EvalDatasets(
+        lm_corpus=make_lm_fixture(),
+        em=make_em_fixture(),
+        f1=make_f1_fixture(),
+        judge=make_judge_fixture(),
+    )
+    training = train_model(config.to_train_config())
+    print(
+        f"eval-pipeline: seed={config.seed} "
+        f"train_pairs={len(make_training_pairs())} "
+        f"lm_train={len(make_lm_training_corpus())} "
+        f"eval_lm={len(datasets.lm_corpus)} "
+        f"eval_em={len(datasets.em)} eval_f1={len(datasets.f1)} "
+        f"eval_judge={len(datasets.judge)}",
+        flush=True,
+    )
+    print(
+        f"model: parameters={training.parameters} hidden={config.hidden} "
+        f"heads={config.num_heads} layers={config.num_layers} "
+        f"context={training.tokenizer.max_len}",
+        flush=True,
+    )
+    print(
+        f"training: lm_steps={config.lm_steps} "
+        f"lm_loss={training.lm_losses[0]:.4f}->{training.lm_losses[-1]:.4f} "
+        f"sft_epochs={config.sft_epochs} "
+        f"sft_loss={training.sft_losses[0]:.4f}->{training.sft_losses[-1]:.4f}",
+        flush=True,
+    )
+
+    suite = EvalSuite(
+        training.model,
+        training.tokenizer,
+        datasets,
+        max_new_tokens=config.max_new_tokens,
+    )
+    results = suite.run()
+    metadata: dict[str, JsonValue] = {
+        "model": {
+            "parameters": training.parameters,
+            "hidden": config.hidden,
+            "heads": config.num_heads,
+            "layers": config.num_layers,
+        },
+        "tokenizer": {
+            "kind": "byte",
+            "vocab_size": VOCAB_SIZE,
+            "context_length": training.tokenizer.max_len,
+        },
+        "training": {
+            "seed": config.seed,
+            "lm_steps": config.lm_steps,
+            "sft_epochs": config.sft_epochs,
+            "sft_batch_size": config.sft_batch_size,
+            "pairs": len(make_training_pairs()),
+            "lm_documents": len(make_lm_training_corpus()),
+            "lm_first_loss": training.lm_losses[0],
+            "lm_final_loss": training.lm_losses[-1],
+            "sft_first_loss": training.sft_losses[0],
+            "sft_final_loss": training.sft_losses[-1],
+        },
+        "fixtures": {
+            "lm": len(datasets.lm_corpus),
+            "exact_match": len(datasets.em),
+            "token_f1": len(datasets.f1),
+            "judge": len(datasets.judge),
+        },
+    }
+    final = Aggregator().aggregate(results, metadata=metadata)
+    _print_report(final)
+    _print_diagnostics(results)
+
+    output_path = config.output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(final.to_json() + "\n", encoding="utf-8")
+    print(f"report: {output_path}", flush=True)
+
+    success = (
+        len(results) == len(EVAL_NAMES)
+        and {result.name for result in results} == set(EVAL_NAMES)
+        and all(math.isfinite(result.value) for result in results)
+        and 0.0 <= final.aggregate <= 1.0
+    )
+    try:
+        parsed = _read_report(output_path)
+        evals = parsed.get("evals")
+        success = (
+            success
+            and parsed.get("schema_version") == 1
+            and isinstance(evals, dict)
+            and set(evals) == set(EVAL_NAMES)
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        success = False
+    return DemoReport(
+        final=final,
+        results=results,
+        training=training,
+        output_path=output_path,
+        success=success,
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a tiny GPT and run perplexity, exact-match, token-F1, "
+            "and mock-judge evaluations."
+        )
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lm-steps", type=int, default=80)
+    parser.add_argument("--sft-epochs", type=int, default=60)
+    parser.add_argument("--sft-batch-size", type=int, default=8)
+    parser.add_argument("--hidden", type=int, default=96)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument(
+        "--output", type=Path, default=Path("outputs/report.json")
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        try:
+            config = DemoConfig(
+                seed=args.seed,
+                lm_steps=args.lm_steps,
+                sft_epochs=args.sft_epochs,
+                sft_batch_size=args.sft_batch_size,
+                hidden=args.hidden,
+                num_heads=args.num_heads,
+                num_layers=args.num_layers,
+                max_new_tokens=args.max_new_tokens,
+                output_path=args.output,
+            )
+            report = run_demo(config)
+        except (TypeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr, flush=True)
+            return 2
+        if not report.success:
+            print("error: demo self-check failed", file=sys.stderr, flush=True)
+            return 1
+        return 0
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

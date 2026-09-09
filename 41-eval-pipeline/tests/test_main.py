@@ -4,6 +4,7 @@ import json
 import math
 from collections import Counter
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 import torch
@@ -18,6 +19,7 @@ from main import (
     RESP_ID,
     VOCAB_SIZE,
     Aggregator,
+    DemoConfig,
     EvalDatasets,
     EvalResult,
     EvalSuite,
@@ -32,7 +34,9 @@ from main import (
     count_parameters,
     exact_match,
     exact_match_eval,
+    generate_greedy,
     judge_eval,
+    main,
     make_em_fixture,
     make_f1_fixture,
     make_judge_fixture,
@@ -42,6 +46,7 @@ from main import (
     mock_judge,
     normalise_text,
     perplexity_eval,
+    run_demo,
     token_f1,
     token_f1_eval,
 )
@@ -161,14 +166,14 @@ def test_seeded_models_are_deterministic() -> None:
 
 def test_fixtures_are_deterministic_held_out_and_balanced() -> None:
     training = make_training_pairs()
-    assert len(training) == 150
+    assert len(training) == 233
     assert len({pair.instruction for pair in training}) == len(training)
     assert Counter(pair.category for pair in training) == {
-        "capitals": 24,
-        "arithmetic": 18,
-        "lists": 42,
-        "definitions": 36,
-        "summaries": 30,
+        "capitals": 40,
+        "arithmetic": 30,
+        "lists": 58,
+        "definitions": 63,
+        "summaries": 42,
     }
 
     em = make_em_fixture()
@@ -538,6 +543,88 @@ def test_aggregator_rejects_invalid_configuration_and_results() -> None:
         Aggregator({"exact_match": 1.0}).aggregate(
             (_result("exact_match", 1.0), _result("token_f1", 1.0))
         )
+
+
+class ScriptedGenerationModel(torch.nn.Module):
+    def __init__(self, ids: Sequence[int]) -> None:
+        super().__init__()
+        self._ids = tuple(ids)
+        self.calls = 0
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        batch, length = token_ids.shape
+        logits = torch.zeros((batch, length, VOCAB_SIZE))
+        next_id = self._ids[min(self.calls, len(self._ids) - 1)]
+        logits[0, -1, next_id] = 20.0
+        self.calls += 1
+        return logits
+
+
+def test_generation_stops_at_newline_and_respects_limit() -> None:
+    tokenizer = InstructionTokenizer()
+    model = ScriptedGenerationModel([ord("O"), ord("K"), NEWLINE_ID])
+    assert generate_greedy(model, tokenizer, "Q", 8) == "OK"
+    assert model.calls == 3
+
+    unbounded = ScriptedGenerationModel([ord("A")] * 20)
+    assert len(generate_greedy(unbounded, tokenizer, "Q", 5)) == 5
+    assert unbounded.calls == 5
+
+
+def test_tiny_demo_writes_structural_report(tmp_path: Path) -> None:
+    output_path = tmp_path / "report.json"
+    config = DemoConfig(
+        lm_steps=1,
+        sft_epochs=1,
+        hidden=16,
+        num_heads=2,
+        num_layers=1,
+        max_new_tokens=4,
+        output_path=output_path,
+    )
+    report = run_demo(config)
+    assert report.success
+    assert {result.name for result in report.results} == {
+        "perplexity",
+        "exact_match",
+        "token_f1",
+        "judge",
+    }
+    assert 0.0 <= report.final.aggregate <= 1.0
+    parsed = json.loads(output_path.read_text(encoding="utf-8"))
+    assert parsed["schema_version"] == 1
+    assert set(parsed["evals"]) == {
+        "perplexity",
+        "exact_match",
+        "token_f1",
+        "judge",
+    }
+    assert parsed["evals"]["perplexity"]["num_examples"] == 20
+
+
+def test_cli_invalid_config_and_tiny_success(tmp_path: Path) -> None:
+    assert main(["--hidden", "0"]) == 2
+    output_path = tmp_path / "cli.json"
+    exit_code = main(
+        [
+            "--lm-steps",
+            "1",
+            "--sft-epochs",
+            "1",
+            "--hidden",
+            "16",
+            "--num-heads",
+            "2",
+            "--num-layers",
+            "1",
+            "--max-new-tokens",
+            "4",
+            "--output",
+            str(output_path),
+        ]
+    )
+    assert exit_code == 0
+    assert output_path.is_file()
 
 
 def test_report_json_has_stable_keys_and_recomputable_aggregate() -> None:
