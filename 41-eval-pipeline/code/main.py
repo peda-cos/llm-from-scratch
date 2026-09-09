@@ -11,6 +11,7 @@ download, or a provider API.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -385,3 +386,409 @@ def count_parameters(module: nn.Module, *, trainable_only: bool = False) -> int:
         for parameter in module.parameters()
         if parameter.requires_grad or not trainable_only
     )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic synthetic fixtures
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class QaExample:
+    """One instruction with a single reference answer."""
+
+    instruction: str
+    reference: str
+    category: str
+
+    def __post_init__(self) -> None:
+        instruction = _require_text("instruction", self.instruction)
+        reference = _require_text("reference", self.reference)
+        if "\n" in instruction or "\r" in instruction:
+            raise ValueError("instruction must be a single line")
+        if "\n" in reference or "\r" in reference:
+            raise ValueError("reference must be a single line")
+        _require_text("category", self.category)
+
+
+_CAPITALS: tuple[tuple[str, str], ...] = (
+    ("France", "Paris"),
+    ("Spain", "Madrid"),
+    ("Italy", "Rome"),
+    ("Japan", "Tokyo"),
+    ("Kenya", "Nairobi"),
+    ("Canada", "Ottawa"),
+    ("Brazil", "Brasilia"),
+    ("Egypt", "Cairo"),
+)
+
+_CAPITAL_TRAIN_TEMPLATES: tuple[str, ...] = (
+    "What is the capital of {country}?",
+    "Name the capital city of {country}.",
+    "Tell me {country}'s capital.",
+)
+_CAPITAL_EM_TEMPLATE = "The capital of {country} is?"
+
+_ARITHMETIC: tuple[tuple[int, int, str], ...] = (
+    (2, 3, "+"),
+    (7, 6, "*"),
+    (9, 4, "-"),
+    (12, 3, "/"),
+    (5, 5, "+"),
+    (8, 2, "*"),
+)
+
+_ARITHMETIC_TRAIN_TEMPLATES: tuple[str, ...] = (
+    "What is {a} {op} {b}?",
+    "Compute {a} {op} {b}.",
+    "How much is {a} {op} {b}?",
+)
+_ARITHMETIC_EM_TEMPLATE = "{a} {op} {b} equals?"
+
+_LISTS: tuple[tuple[str, str], ...] = (
+    ("colors", "red, green, blue."),
+    ("planets", "mercury, venus, earth."),
+    ("vowels", "a, e, i, o, u."),
+    ("days", "monday, tuesday, wednesday."),
+    ("animals", "cat, dog, bird."),
+    ("fruits", "apple, banana, cherry."),
+    ("oceans", "pacific, atlantic, indian."),
+    ("shapes", "circle, square, triangle."),
+    ("instruments", "piano, guitar, violin."),
+    ("metals", "iron, copper, gold."),
+    ("seasons", "spring, summer, autumn."),
+    ("languages", "python, rust, go."),
+    ("vehicles", "car, train, plane."),
+    ("trees", "oak, pine, maple."),
+)
+_EM_LIST_COUNT = 6
+
+_LIST_TRAIN_TEMPLATES: tuple[str, ...] = (
+    "List three {name}.",
+    "Name three {name}.",
+    "Give three examples of {name}.",
+)
+_LIST_EVAL_TEMPLATE = "Which three {name} come to mind?"
+
+_DEFINITIONS: tuple[tuple[str, str], ...] = (
+    ("variable", "a name bound to a value."),
+    ("function", "a reusable block of code."),
+    ("loop", "code that repeats a block."),
+    ("token", "a unit of text."),
+    ("gradient", "a slope of a loss."),
+    ("tensor", "a multidimensional array."),
+    ("optimizer", "a rule that updates weights."),
+    ("checkpoint", "a saved model state."),
+    ("dataset", "a collection of examples."),
+    ("inference", "running a trained model."),
+    ("prompt", "an instruction given to a model."),
+    ("embedding", "a learned vector representation."),
+)
+_JUDGE_DEFINITION_COUNT = 10
+
+_DEFINITION_TRAIN_TEMPLATES: tuple[str, ...] = (
+    "Define {term}.",
+    "What is a {term}?",
+    "Explain the term {term}.",
+)
+_F1_DEFINITION_TEMPLATE = "Give a definition of {term}."
+_JUDGE_DEFINITION_TEMPLATE = "In one sentence, define {term}."
+
+_SUMMARIES: tuple[str, ...] = (
+    "cats sleep a lot.",
+    "water boils at 100c.",
+    "the moon orbits earth.",
+    "plants need sunlight.",
+    "ice is frozen water.",
+    "birds have feathers.",
+    "the sun is a star.",
+    "fish live in water.",
+    "rocks are hard.",
+    "fire is hot.",
+)
+
+_SUMMARY_TRAIN_TEMPLATES: tuple[str, ...] = (
+    "Summarise: {text}",
+    "In brief: {text}",
+    "Shorten: {text}",
+)
+_SUMMARY_JUDGE_TEMPLATE = "Summary: {text}"
+
+
+def _arithmetic_response(first: int, second: int, operator: str) -> str:
+    if operator == "+":
+        result = first + second
+    elif operator == "*":
+        result = first * second
+    elif operator == "-":
+        result = first - second
+    elif operator == "/":
+        if second == 0 or first % second != 0:
+            raise ValueError("division fixture must be exact")
+        result = first // second
+    else:
+        raise ValueError(f"unsupported operator {operator!r}")
+    return str(result)
+
+
+def _make_pairs() -> list[QaExample]:
+    pairs: list[QaExample] = []
+    for country, city in _CAPITALS:
+        for template in _CAPITAL_TRAIN_TEMPLATES:
+            pairs.append(
+                QaExample(
+                    template.format(country=country),
+                    f"{city}.",
+                    "capitals",
+                )
+            )
+    for first, second, operator in _ARITHMETIC:
+        response = _arithmetic_response(first, second, operator)
+        for template in _ARITHMETIC_TRAIN_TEMPLATES:
+            pairs.append(
+                QaExample(
+                    template.format(a=first, op=operator, b=second),
+                    response,
+                    "arithmetic",
+                )
+            )
+    for name, items in _LISTS:
+        for template in _LIST_TRAIN_TEMPLATES:
+            pairs.append(
+                QaExample(
+                    template.format(name=name),
+                    items,
+                    "lists",
+                )
+            )
+    for term, definition in _DEFINITIONS:
+        for template in _DEFINITION_TRAIN_TEMPLATES:
+            pairs.append(
+                QaExample(
+                    template.format(term=term),
+                    definition,
+                    "definitions",
+                )
+            )
+    for text in _SUMMARIES:
+        for template in _SUMMARY_TRAIN_TEMPLATES:
+            pairs.append(
+                QaExample(
+                    template.format(text=text),
+                    text,
+                    "summaries",
+                )
+            )
+    return pairs
+
+
+def make_training_pairs() -> tuple[QaExample, ...]:
+    """Return the fixed 150-pair training split."""
+    pairs = _make_pairs()
+    if len(pairs) != 150:
+        raise ValueError(f"training fixture must contain 150 pairs, found {len(pairs)}")
+    instructions = {pair.instruction for pair in pairs}
+    if len(instructions) != len(pairs):
+        raise ValueError("training instructions must be unique")
+    return tuple(pairs)
+
+
+def make_lm_training_corpus() -> tuple[str, ...]:
+    """Return 30 declarative training sentences."""
+    sentences: list[str] = [
+        f"The capital of {country} is {city}."
+        for country, city in _CAPITALS
+    ]
+    sentences.extend(
+        f"{first} {operator} {second} equals "
+        f"{_arithmetic_response(first, second, operator)}."
+        for first, second, operator in _ARITHMETIC
+    )
+    sentences.extend(
+        f"{items.rstrip('.')} are examples of {name}."
+        for name, items in _LISTS[:6]
+    )
+    sentences.extend(
+        f"{term} is {definition}"
+        for term, definition in _DEFINITIONS[:5]
+    )
+    sentences.extend(_SUMMARIES[:5])
+    if len(sentences) != 30:
+        raise ValueError(f"LM training corpus must have 30 sentences, found {len(sentences)}")
+    return tuple(sentences)
+
+
+def make_lm_fixture() -> tuple[str, ...]:
+    """Return 20 held-out declarative sentences."""
+    sentences: list[str] = [
+        f"{city} is the capital city of {country}."
+        for country, city in _CAPITALS
+    ]
+    sentences.extend(
+        f"When you compute {first} {operator} {second}, you get "
+        f"{_arithmetic_response(first, second, operator)}."
+        for first, second, operator in _ARITHMETIC
+    )
+    sentences.extend(
+        f"Examples of {name} include {items.rstrip('.')}."
+        for name, items in _LISTS[:6]
+    )
+    if len(sentences) != 20:
+        raise ValueError(f"LM fixture must have 20 sentences, found {len(sentences)}")
+    return tuple(sentences)
+
+
+def make_em_fixture() -> tuple[QaExample, ...]:
+    """Return 20 held-out short-form factual prompts."""
+    examples: list[QaExample] = [
+        QaExample(
+            _CAPITAL_EM_TEMPLATE.format(country=country),
+            f"{city}.",
+            "capitals",
+        )
+        for country, city in _CAPITALS
+    ]
+    examples.extend(
+        QaExample(
+            _ARITHMETIC_EM_TEMPLATE.format(a=first, op=operator, b=second),
+            _arithmetic_response(first, second, operator),
+            "arithmetic",
+        )
+        for first, second, operator in _ARITHMETIC
+    )
+    examples.extend(
+        QaExample(
+            _LIST_EVAL_TEMPLATE.format(name=name),
+            items,
+            "lists",
+        )
+        for name, items in _LISTS[:_EM_LIST_COUNT]
+    )
+    return _validate_fixture(examples, expected=20, name="EM")
+
+
+def make_f1_fixture() -> tuple[QaExample, ...]:
+    """Return 20 held-out open-form prompts with multi-token references."""
+    examples: list[QaExample] = [
+        QaExample(
+            _LIST_EVAL_TEMPLATE.format(name=name),
+            items,
+            "lists",
+        )
+        for name, items in _LISTS[_EM_LIST_COUNT:]
+    ]
+    examples.extend(
+        QaExample(
+            _F1_DEFINITION_TEMPLATE.format(term=term),
+            definition,
+            "definitions",
+        )
+        for term, definition in _DEFINITIONS
+    )
+    return _validate_fixture(examples, expected=20, name="F1")
+
+
+def make_judge_fixture() -> tuple[QaExample, ...]:
+    """Return 20 held-out prompts for qualitative judging."""
+    examples: list[QaExample] = [
+        QaExample(
+            _JUDGE_DEFINITION_TEMPLATE.format(term=term),
+            definition,
+            "definitions",
+        )
+        for term, definition in _DEFINITIONS[:_JUDGE_DEFINITION_COUNT]
+    ]
+    examples.extend(
+        QaExample(
+            _SUMMARY_JUDGE_TEMPLATE.format(text=text),
+            text,
+            "summaries",
+        )
+        for text in _SUMMARIES
+    )
+    return _validate_fixture(examples, expected=20, name="judge")
+
+
+def _validate_fixture(
+    examples: Sequence[QaExample], *, expected: int, name: str
+) -> tuple[QaExample, ...]:
+    values = tuple(examples)
+    if len(values) != expected:
+        raise ValueError(f"{name} fixture must have {expected} examples")
+    instructions = {example.instruction for example in values}
+    if len(instructions) != len(values):
+        raise ValueError(f"{name} prompts must be unique")
+    tokenizer = InstructionTokenizer()
+    for example in values:
+        tokenizer.encode_example(example.instruction, example.reference)
+    return values
+
+
+# ---------------------------------------------------------------------------
+# Exact match, token F1, and the deterministic mock judge
+# ---------------------------------------------------------------------------
+
+
+def normalise_text(text: str) -> str:
+    """Lowercase, collapse whitespace, and drop trailing terminal punctuation."""
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    collapsed = " ".join(text.lower().split())
+    while collapsed and collapsed[-1] in ".!?":
+        collapsed = collapsed[:-1].rstrip()
+    return collapsed
+
+
+def exact_match(prediction: str, reference: str) -> bool:
+    """Compare two answers after normalisation."""
+    return normalise_text(prediction) == normalise_text(reference)
+
+
+def token_f1(prediction: str, reference: str) -> float:
+    """Token-level F1 over a whitespace bag-of-tokens."""
+    prediction_tokens = normalise_text(prediction).split()
+    reference_tokens = normalise_text(reference).split()
+    if not prediction_tokens and not reference_tokens:
+        return 1.0
+    if not prediction_tokens or not reference_tokens:
+        return 0.0
+    common = Counter(prediction_tokens) & Counter(reference_tokens)
+    matches = sum(common.values())
+    if matches == 0:
+        return 0.0
+    precision = matches / len(prediction_tokens)
+    recall = matches / len(reference_tokens)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+@dataclass(frozen=True)
+class JudgeVerdict:
+    score: int
+    rationale: str
+
+    def __post_init__(self) -> None:
+        score = _require_int("score", self.score, minimum=1)
+        if score > 5:
+            raise ValueError("score must be <= 5")
+        _require_text("rationale", self.rationale)
+
+
+def mock_judge(
+    instruction: str, prediction: str, reference: str
+) -> JudgeVerdict:
+    """Score a prediction deterministically against a reference on 1-5."""
+    _require_text("instruction", instruction)
+    if not isinstance(prediction, str):
+        raise TypeError("prediction must be a string")
+    if not isinstance(reference, str):
+        raise TypeError("reference must be a string")
+    if normalise_text(prediction) == normalise_text(reference):
+        return JudgeVerdict(5, "exact normalised match")
+    score = token_f1(prediction, reference)
+    if score >= 0.8:
+        return JudgeVerdict(4, f"token F1 {score:.3f} >= 0.80")
+    if score >= 0.5:
+        return JudgeVerdict(3, f"token F1 {score:.3f} in [0.50, 0.80)")
+    if score >= 0.2:
+        return JudgeVerdict(2, f"token F1 {score:.3f} in [0.20, 0.50)")
+    return JudgeVerdict(1, f"token F1 {score:.3f} < 0.20")
