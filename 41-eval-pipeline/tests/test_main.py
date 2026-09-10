@@ -494,11 +494,14 @@ def _result(name: str, value: float) -> EvalResult:
 def test_aggregator_normalisation_contract() -> None:
     assert Aggregator.normalise("perplexity", 1.0) == 1.0
     assert Aggregator.normalise("perplexity", math.e) == pytest.approx(0.5)
+    assert Aggregator.normalise("perplexity", math.inf) == 0.0
     assert Aggregator.normalise("exact_match", 0.25) == 0.25
     assert Aggregator.normalise("token_f1", 1.0) == 1.0
     assert Aggregator.normalise("judge", 5.0) == 1.0
     for name, value in (
         ("perplexity", 0.5),
+        ("perplexity", -math.inf),
+        ("perplexity", math.nan),
         ("exact_match", 1.1),
         ("token_f1", -0.1),
         ("judge", 0.0),

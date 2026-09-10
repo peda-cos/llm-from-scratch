@@ -1436,6 +1436,14 @@ class Aggregator:
     def normalise(name: str, value: float) -> float:
         if name not in EVAL_NAMES:
             raise ValueError(f"unknown eval name {name!r}")
+        if (
+            name == "perplexity"
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isinf(float(value))
+            and value > 0
+        ):
+            return 0.0
         number = _require_float("value", value, minimum=0.0)
         if name == "perplexity":
             if number < 1.0:

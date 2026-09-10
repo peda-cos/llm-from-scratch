@@ -152,7 +152,9 @@ The default weights are 0.2 perplexity, 0.3 exact match, 0.3 token F1, and 0.2
 judge. The aggregator divides by the sum of the configured weights, so a
 caller may use any positive scale. Contributions sum to the aggregate. Because
 the spec defines judge normalisation as `score / 5`, the minimum normalised
-judge contribution is 0.2, not 0.
+judge contribution is 0.2, not 0. A positive infinite perplexity normalises to
+0; `perplexity_eval` itself rejects non-finite values, so a broken forward pass
+cannot silently enter a report.
 
 ## Data and held-out policy
 
