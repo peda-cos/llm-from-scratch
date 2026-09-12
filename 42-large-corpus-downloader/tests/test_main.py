@@ -136,6 +136,10 @@ def test_planner_derives_ids_paths_and_public_urls(tmp_path: Path) -> None:
     from main import _public_url  # small helper with no state
 
     assert _public_url(urls[0]) == "file:///data/shard-0001.jsonl.zst"
+    assert (
+        _public_url("https://user:pass@example.invalid/corpus/shard.zst?token=redacted")
+        == "https://example.invalid/corpus/shard.zst"
+    )
 
 
 def test_planner_rejects_invalid_plans(tmp_path: Path) -> None:

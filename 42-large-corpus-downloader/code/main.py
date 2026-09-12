@@ -169,7 +169,10 @@ def _splitmix64(value: int) -> int:
 
 def _public_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def _resolve_relative(base: Path, relative: str) -> Path:

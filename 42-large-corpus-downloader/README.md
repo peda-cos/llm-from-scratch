@@ -165,8 +165,9 @@ files; it is not a signature.
 ## Real-provider mode
 
 The same CLI accepts HTTPS shard URLs. Use pre-signed URLs; the manifest records
-the URL without its query string, so credentials in query parameters are not
-persisted. There is no custom-header or OAuth support in this lesson.
+the URL without its query string or userinfo, so credentials in query parameters
+or `user:pass@` syntax are not persisted. There is no custom-header or OAuth
+support in this lesson.
 
 ```bash
 uv run --frozen python code/main.py fetch \
