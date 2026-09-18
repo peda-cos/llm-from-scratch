@@ -99,7 +99,8 @@ def test_writer_flushes_header_and_rows_before_exit(tmp_path: Path) -> None:
 
 
 def test_writer_rejects_writes_outside_context(tmp_path: Path) -> None:
-    writer = StepLogWriter(tmp_path / "closed.csv")
+    path = tmp_path / "closed.csv"
+    writer = StepLogWriter(path)
     with pytest.raises(RuntimeError, match="not open"):
         writer.write(
             StepLog(
@@ -113,8 +114,7 @@ def test_writer_rejects_writes_outside_context(tmp_path: Path) -> None:
             )
         )
 
-    path = tmp_path / "used.csv"
-    with StepLogWriter(path):
+    with writer:
         pass
     with pytest.raises(RuntimeError, match="not open"):
         writer.write(
