@@ -1,0 +1,13 @@
+{
+  "micro_batch": 8,
+  "accum_steps": [1, 2, 4, 8, 16, 32, 64],
+  "num_steps": 12,
+  "lr": 0.1,
+  "momentum": 0.9,
+  "optimizer": "sgd",
+  "seed": 7,
+  "input_dim": 6,
+  "hidden_dim": 16,
+  "num_classes": 3,
+  "noise": 0.7
+}
