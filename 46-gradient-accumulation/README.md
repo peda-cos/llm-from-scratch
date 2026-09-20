@@ -244,6 +244,20 @@ Reading the curve:
 - This is a tiny MLP, so Python dispatch dominates more than it would in a large
   transformer. The absolute numbers are not a hardware benchmark.
 
+### Reproducing the table
+
+From `46-gradient-accumulation/`:
+
+```bash
+uv run --frozen python code/main.py
+jq '.points' outputs/accum-curve.json
+```
+
+The JSON is the source of truth. Reruns change `wall_time_sec`,
+`samples_per_sec`, and `median_step_ms`; the counters, losses, schema, and skill
+recipe stay deterministic. The test suite asserts that split so a timing change
+cannot hide a bookkeeping regression.
+
 ## What runs offline
 
 Everything except dependency installation:
