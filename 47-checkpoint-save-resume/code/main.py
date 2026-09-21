@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import hmac
 import json
@@ -255,3 +256,69 @@ def _seed_training_rng(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def _fsync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            # shortcut: directory fsync is unsupported on a few filesystems.
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
+    finally:
+        os.close(fd)
+
+
+def _atomic_write(path: Path, writer: Callable[[BinaryIO], None]) -> None:
+    """Write through a same-directory temp file, fsync, then atomically replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            writer(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_save(path: Path, payload: object) -> None:
+    _atomic_write(path, lambda handle: torch.save(payload, handle))
+
+
+def atomic_write_json(path: Path, payload: object) -> None:
+    encoded = (
+        json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    def write(handle: BinaryIO) -> None:
+        handle.write(encoded)
+
+    _atomic_write(path, write)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    encoded = text.encode("utf-8")
+
+    def write(handle: BinaryIO) -> None:
+        handle.write(encoded)
+
+    _atomic_write(path, write)
