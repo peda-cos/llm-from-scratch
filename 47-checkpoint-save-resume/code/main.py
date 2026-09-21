@@ -525,3 +525,194 @@ def load_checkpoint(
         train_state_payload=payload.get("train_state"),
         rng_payload=payload.get("rng"),
     )
+
+
+META_KEYS = frozenset(
+    {
+        "schema",
+        "shard_count",
+        "optimizer",
+        "scheduler",
+        "train_state",
+        "rng",
+        "wall_saved_at",
+    }
+)
+
+
+def _sha256_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _resolve_in_directory(base: Path, name: str) -> Path:
+    if not name or Path(name).is_absolute():
+        raise ValueError(f"checkpoint path escapes directory: {name!r}")
+    try:
+        candidate = (base / name).resolve()
+    except OSError as exc:
+        raise ValueError(f"invalid checkpoint path {name!r}: {exc}") from exc
+    if not candidate.is_relative_to(base.resolve()):
+        raise ValueError(f"checkpoint path escapes directory: {name!r}")
+    if not candidate.is_file():
+        raise ValueError(f"missing checkpoint file: {name}")
+    return candidate
+
+
+def _verify_sha256(path: Path, expected: object, label: str) -> None:
+    if not isinstance(expected, str):
+        raise ValueError(f"sha256 for {label} must be a string")
+    actual = _sha256_file(path)
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError(
+            f"sha256 mismatch for {label} {path.name}: "
+            f"expected {expected}, got {actual}"
+        )
+
+
+def _parse_index_entry(value: object, label: str) -> tuple[str, str]:
+    entry = _require_mapping(label, value)
+    return (
+        _require_str(f"{label}.file", entry.get("file")),
+        _require_str(f"{label}.sha256", entry.get("sha256")),
+    )
+
+
+def save_sharded_checkpoint(
+    directory: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LRScheduler,
+    train_state: TrainState,
+    num_shards: int,
+) -> Path:
+    count = _require_int("num_shards", num_shards, minimum=1)
+    state_dict = model.state_dict()
+    if count > len(state_dict):
+        raise ValueError(
+            f"num_shards must be <= {len(state_dict)} model state entries"
+        )
+    directory.mkdir(parents=True, exist_ok=True)
+    token = f"step{train_state.step:08d}-{uuid.uuid4().hex[:12]}"
+
+    shards: list[dict[str, Tensor]] = [{} for _ in range(count)]
+    for index, (key, value) in enumerate(state_dict.items()):
+        shards[index % count][key] = value
+
+    shard_entries: list[dict[str, str]] = []
+    for index, shard in enumerate(shards):
+        shard_path = directory / f"model.shard-{index:03d}.{token}.pt"
+        atomic_save(shard_path, shard)
+        shard_entries.append(
+            {"file": shard_path.name, "sha256": _sha256_file(shard_path)}
+        )
+
+    meta_path = directory / f"meta.{token}.pt"
+    meta_payload: dict[str, object] = {
+        "schema": CHECKPOINT_SCHEMA,
+        "shard_count": count,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "train_state": train_state.as_dict(),
+        "rng": capture_rng_state(),
+        "wall_saved_at": time.time(),
+    }
+    atomic_save(meta_path, meta_payload)
+
+    index_payload = {
+        "schema": INDEX_SCHEMA,
+        "shard_count": count,
+        "shards": shard_entries,
+        "meta": {
+            "file": meta_path.name,
+            "sha256": _sha256_file(meta_path),
+        },
+    }
+    index_path = directory / "index.json"
+    atomic_write_json(index_path, index_payload)
+    return index_path
+
+
+def load_sharded_checkpoint(
+    directory: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LRScheduler,
+) -> TrainState:
+    index_path = directory / "index.json"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"checkpoint index not found: {index_path}")
+    try:
+        raw_index = json.loads(index_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read checkpoint index {index_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in checkpoint index {index_path}: {exc}") from exc
+
+    index_payload = _require_mapping("checkpoint index", raw_index)
+    _require_schema(index_payload, INDEX_SCHEMA, "checkpoint index")
+    shard_count = _require_int(
+        "index.shard_count",
+        index_payload.get("shard_count"),
+        minimum=1,
+    )
+    raw_shards = index_payload.get("shards")
+    if not isinstance(raw_shards, list):
+        raise ValueError("index.shards must be a list")
+    shard_entries = [
+        _parse_index_entry(value, f"index.shards[{index}]")
+        for index, value in enumerate(raw_shards)
+    ]
+    if len(shard_entries) != shard_count:
+        raise ValueError(
+            f"index.shard_count is {shard_count} but {len(shard_entries)} shards are listed"
+        )
+    meta_file, meta_sha = _parse_index_entry(index_payload.get("meta"), "index.meta")
+
+    base = directory.resolve()
+    shard_paths = [
+        (name, digest, _resolve_in_directory(base, name))
+        for name, digest in shard_entries
+    ]
+    meta_path = _resolve_in_directory(base, meta_file)
+
+    for name, digest, path in shard_paths:
+        _verify_sha256(path, digest, f"shard {name}")
+    _verify_sha256(meta_path, meta_sha, f"meta {meta_file}")
+
+    meta_payload = _require_mapping("checkpoint meta", _torch_load(meta_path))
+    _require_schema(meta_payload, CHECKPOINT_SCHEMA, "checkpoint meta")
+    missing = sorted(META_KEYS - set(meta_payload))
+    if missing:
+        raise ValueError(f"checkpoint meta is missing keys: {', '.join(missing)}")
+    meta_shard_count = _require_int(
+        "meta.shard_count",
+        meta_payload.get("shard_count"),
+        minimum=1,
+    )
+    if meta_shard_count != shard_count:
+        raise ValueError(
+            f"meta.shard_count is {meta_shard_count} but index has {shard_count}"
+        )
+    _validate_wall_saved_at(meta_payload.get("wall_saved_at"))
+
+    merged: dict[str, Tensor] = {}
+    for name, _, path in shard_paths:
+        shard_payload = _require_mapping(f"shard {name}", _torch_load(path))
+        for key, value in shard_payload.items():
+            if not isinstance(value, Tensor):
+                raise ValueError(f"shard {name} key {key!r} is not a tensor")
+            if key in merged:
+                raise ValueError(f"duplicate key across shards: {key!r}")
+            merged[key] = value
+
+    return _apply_training_payload(
+        model,
+        optimizer,
+        scheduler,
+        model_state=merged,
+        optimizer_state=meta_payload.get("optimizer"),
+        scheduler_state=meta_payload.get("scheduler"),
+        train_state_payload=meta_payload.get("train_state"),
+        rng_payload=meta_payload.get("rng"),
+    )
