@@ -322,3 +322,206 @@ def _atomic_write_text(path: Path, text: str) -> None:
         handle.write(encoded)
 
     _atomic_write(path, write)
+
+
+TRAIN_STATE_KEYS = frozenset(
+    {"step", "epoch", "batch_in_epoch", "batches_per_epoch", "losses"}
+)
+CHECKPOINT_KEYS = frozenset(
+    {"schema", "model", "optimizer", "scheduler", "train_state", "rng", "wall_saved_at"}
+)
+
+
+@dataclass(frozen=True)
+class TrainState:
+    step: int
+    epoch: int
+    batch_in_epoch: int
+    batches_per_epoch: int
+    losses: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_int("step", self.step, minimum=0)
+        _require_int("epoch", self.epoch, minimum=0)
+        _require_int("batch_in_epoch", self.batch_in_epoch, minimum=0)
+        _require_int("batches_per_epoch", self.batches_per_epoch, minimum=1)
+        if self.batch_in_epoch >= self.batches_per_epoch:
+            raise ValueError("batch_in_epoch must be < batches_per_epoch")
+        if not isinstance(self.losses, tuple):
+            raise ValueError("losses must be a tuple")
+        normalized = tuple(
+            _require_float("losses[]", loss) for loss in self.losses
+        )
+        object.__setattr__(self, "losses", normalized)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "step": self.step,
+            "epoch": self.epoch,
+            "batch_in_epoch": self.batch_in_epoch,
+            "batches_per_epoch": self.batches_per_epoch,
+            "losses": list(self.losses),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> TrainState:
+        keys = set(payload)
+        if keys != TRAIN_STATE_KEYS:
+            missing = sorted(TRAIN_STATE_KEYS - keys)
+            unknown = sorted(keys - TRAIN_STATE_KEYS)
+            raise ValueError(
+                "train_state keys mismatch: "
+                f"missing={missing}, unknown={unknown}"
+            )
+        raw_losses = payload.get("losses")
+        if not isinstance(raw_losses, list):
+            raise ValueError("train_state.losses must be a list")
+        return cls(
+            step=_require_int("train_state.step", payload.get("step"), minimum=0),
+            epoch=_require_int("train_state.epoch", payload.get("epoch"), minimum=0),
+            batch_in_epoch=_require_int(
+                "train_state.batch_in_epoch",
+                payload.get("batch_in_epoch"),
+                minimum=0,
+            ),
+            batches_per_epoch=_require_int(
+                "train_state.batches_per_epoch",
+                payload.get("batches_per_epoch"),
+                minimum=1,
+            ),
+            losses=tuple(
+                _require_float("train_state.losses[]", value)
+                for value in raw_losses
+            ),
+        )
+
+    def advance(self, loss: float) -> TrainState:
+        value = _require_float("loss", loss)
+        step = self.step + 1
+        if self.batch_in_epoch + 1 >= self.batches_per_epoch:
+            epoch = self.epoch + 1
+            batch_in_epoch = 0
+        else:
+            epoch = self.epoch
+            batch_in_epoch = self.batch_in_epoch + 1
+        return TrainState(
+            step=step,
+            epoch=epoch,
+            batch_in_epoch=batch_in_epoch,
+            batches_per_epoch=self.batches_per_epoch,
+            losses=self.losses + (value,),
+        )
+
+
+def _require_schema(
+    payload: Mapping[str, object],
+    expected: str,
+    label: str,
+) -> None:
+    schema = payload.get("schema")
+    if schema != expected:
+        raise ValueError(
+            f"{label} has unsupported schema {schema!r}; expected {expected!r}"
+        )
+
+
+def _validate_wall_saved_at(value: object) -> None:
+    _require_float("wall_saved_at", value, minimum=0.0)
+
+
+def _torch_load(path: Path) -> object:
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint file not found: {path}")
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError(f"cannot load checkpoint {path}: {exc}") from exc
+
+
+def _checkpoint_payload(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LRScheduler,
+    train_state: TrainState,
+) -> dict[str, object]:
+    return {
+        "schema": CHECKPOINT_SCHEMA,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "train_state": train_state.as_dict(),
+        "rng": capture_rng_state(),
+        "wall_saved_at": time.time(),
+    }
+
+
+def _apply_training_payload(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LRScheduler,
+    *,
+    model_state: object,
+    optimizer_state: object,
+    scheduler_state: object,
+    train_state_payload: object,
+    rng_payload: object,
+) -> TrainState:
+    model_mapping = _require_mapping("model state", model_state)
+    optimizer_mapping = _require_mapping("optimizer state", optimizer_state)
+    scheduler_mapping = _require_mapping("scheduler state", scheduler_state)
+    rng_mapping = _require_mapping("rng state", rng_payload)
+    train_state = TrainState.from_dict(
+        _require_mapping("train_state", train_state_payload)
+    )
+
+    try:
+        model.load_state_dict(model_mapping)
+    except RuntimeError as exc:
+        raise ValueError(f"model state mismatch: {exc}") from exc
+    try:
+        optimizer.load_state_dict(dict(optimizer_mapping))
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"optimizer state mismatch: {exc}") from exc
+    try:
+        scheduler.load_state_dict(dict(scheduler_mapping))
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"scheduler state mismatch: {exc}") from exc
+    restore_rng_state(rng_mapping)
+    return train_state
+
+
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LRScheduler,
+    train_state: TrainState,
+) -> None:
+    atomic_save(
+        path,
+        _checkpoint_payload(model, optimizer, scheduler, train_state),
+    )
+
+
+def load_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LRScheduler,
+) -> TrainState:
+    payload = _require_mapping("checkpoint", _torch_load(path))
+    _require_schema(payload, CHECKPOINT_SCHEMA, "checkpoint")
+    missing = sorted(CHECKPOINT_KEYS - set(payload))
+    if missing:
+        raise ValueError(f"checkpoint is missing keys: {', '.join(missing)}")
+    _validate_wall_saved_at(payload.get("wall_saved_at"))
+    return _apply_training_payload(
+        model,
+        optimizer,
+        scheduler,
+        model_state=payload.get("model"),
+        optimizer_state=payload.get("optimizer"),
+        scheduler_state=payload.get("scheduler"),
+        train_state_payload=payload.get("train_state"),
+        rng_payload=payload.get("rng"),
+    )
