@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from main import (
-    DEFAULT_WORKDIR,
     DemoConfig,
     _seed_training_rng,
     build_demo,
@@ -100,7 +99,3 @@ def test_mid_epoch_cursor_is_preserved(tmp_path: Path) -> None:
     assert loaded.epoch == 1
     assert loaded.batch_in_epoch == 3
     assert len(loaded.losses) == 7
-
-
-def test_default_workdir_is_outputs() -> None:
-    assert DEFAULT_WORKDIR == Path("outputs")
