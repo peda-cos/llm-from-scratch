@@ -273,7 +273,7 @@ floor). Command: `./verify.sh`. The default config/seed is used.
 | Resumed steps | 5 | 5 |
 | Checkpoint bytes | 25,011 | 29,551 |
 | Shard count | 1 | 3 |
-| Index SHA-256 (one run) | — | `e8faea61…4cbe034` |
+| Index SHA-256 (one run) | — | `cff7fc7e…eb8a60ee` |
 
 Baseline losses over 12 steps: first `0.643667`, mean `0.472059`, final
 `0.343606`. The pre-interruption prefix difference is `0.0`. The index hash changes
@@ -285,6 +285,17 @@ overhead; the point is verifiable loading, not compression.
 The same run reported **42 passed** tests and strict mypy **no issues in 8 source
 files**. The 25 KB single file is mostly the plain-list RNG payload (Torch CPU
 state is 5,056 bytes as a list) plus four tiny model tensors and AdamW state.
+
+Reproduce the table from the module root:
+
+```bash
+./verify.sh
+uv run --frozen python -c \
+  "import json; p=json.load(open('outputs/resume-demo.json')); print(p['single']['max_abs_diff'], p['sharded']['max_abs_diff'], p['single']['checkpoint_bytes'], p['sharded']['checkpoint_bytes'])"
+```
+
+Reruns regenerate the immutable shard generation, so the index SHA-256 and the
+directory file count change; losses, counters, byte sizes, and pass/fail do not.
 
 ## What runs offline
 
