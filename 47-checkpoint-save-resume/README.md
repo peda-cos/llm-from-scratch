@@ -330,9 +330,12 @@ path containment are device-independent.
   round-robin; `torch.distributed.checkpoint` is the production-scale alternative.
 - SHA-256 is corruption detection, not authentication; there is no signature or
   keyed MAC.
+- The resume worker has a 120-second subprocess timeout; a hang becomes a
+  `RuntimeError` with the worker's stderr.
 - Old shard generations and orphan temp files are not automatically pruned. A
   concurrent reader may still hold the old index, so deletion is the caller's
-  policy.
+  policy; keep the files referenced by the current `index.json` when pruning by
+  hand.
 - The atomic kill test kills a save subprocess, not a full training process. The
   resume demo uses a real fresh interpreter but does not simulate a kernel reboot.
 - No wallclock-triggered save cadence; the demo saves at a step boundary. Add a
