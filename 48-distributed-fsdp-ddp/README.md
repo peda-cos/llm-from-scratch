@@ -343,6 +343,7 @@ throughput benchmark; no speedup claim is made.
 | Final parameter max-abs-diff | 5.96e-08 | 2.98e-08 | 5.96e-08 |
 | Rank state spread | 0.000e+00 | 0.000e+00 | 0.000e+00 |
 | FSDP params bit-equal | yes (4/4) | yes (4/4) | yes (4/4) |
+| FSDP padded params / padding numel | 0 / 0 | 0 / 0 | 0 / 0 |
 | FSDP resident / full bytes | 424 / 848 | 212 / 848 | 424 / 848 |
 | FSDP shard fraction | 0.500 | 0.250 | 0.500 |
 | Median step | 3.260 ms | 5.640 ms | 2.091 ms |
