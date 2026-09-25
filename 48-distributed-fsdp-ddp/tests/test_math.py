@@ -66,16 +66,21 @@ def test_local_gradient_average_matches_full_batch() -> None:
 
 
 def test_split_batch_is_an_exact_partition() -> None:
-    config = tiny_config(world_size=3, batch_per_rank=2)
-    inputs, targets = make_batch(config, 0)
-    parts = [
-        split_batch(inputs, targets, config.world_size, rank)
-        for rank in range(config.world_size)
-    ]
+    for world_size in (2, 3):
+        config = tiny_config(world_size=world_size, batch_per_rank=2)
+        inputs, targets = make_batch(config, 0)
+        parts = [
+            split_batch(inputs, targets, config.world_size, rank)
+            for rank in range(config.world_size)
+        ]
 
-    assert all(part_inputs.shape[0] == 2 for part_inputs, _ in parts)
-    assert torch.equal(torch.cat([part_inputs for part_inputs, _ in parts]), inputs)
-    assert torch.equal(torch.cat([part_targets for _, part_targets in parts]), targets)
+        assert all(part_inputs.shape[0] == 2 for part_inputs, _ in parts)
+        assert torch.equal(
+            torch.cat([part_inputs for part_inputs, _ in parts]), inputs
+        )
+        assert torch.equal(
+            torch.cat([part_targets for _, part_targets in parts]), targets
+        )
 
     with pytest.raises(ValueError, match="divisible"):
         split_batch(torch.randn(5, 4), torch.arange(5), 2, 0)
